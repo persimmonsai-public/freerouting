@@ -906,7 +906,19 @@ public class RoutingBoard extends BasicBoard implements Serializable {
   public AutorouteEngine init_autoroute(int p_net_no, int p_trace_clearance_class_no, Stoppable p_stoppable_thread,
       TimeLimit p_time_limit, boolean p_retain_autoroute_database) {
     if (this.autoroute_engine == null || !p_retain_autoroute_database
+        // A leftover non-retaining engine (e.g. from the fanout stage, which always passes
+        // p_retain = false) must not be adopted as if it were a retained database: it clears
+        // its rooms after every connection but keeps stale drill pages, because its
+        // invalidation hooks are all guarded on maintain_database.
+        || !this.autoroute_engine.maintain_database
         || this.autoroute_engine.autoroute_search_tree.compensated_clearance_class_no != p_trace_clearance_class_no) {
+      if (this.autoroute_engine != null && this.autoroute_engine.maintain_database) {
+        // A retained engine owns completed expansion rooms inside its clearance class's shared
+        // search tree. Replacing the engine without clearing would leak those rooms into the
+        // tree as stale entries that no engine tracks -- and stale rooms describe free space
+        // that may no longer be free.
+        this.autoroute_engine.clear();
+      }
       this.autoroute_engine = new AutorouteEngine(this, p_trace_clearance_class_no, p_retain_autoroute_database);
     }
     this.autoroute_engine.init_connection(p_net_no, p_stoppable_thread, p_time_limit);

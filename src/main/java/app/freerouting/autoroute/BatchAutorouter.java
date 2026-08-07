@@ -142,6 +142,12 @@ public class BatchAutorouter extends NamedAlgorithm {
 
     this.start_ripup_costs = p_start_ripup_costs;
     this.trace_pull_tight_accuracy = p_pull_tight_accuracy;
+    // Measured 2026-08: retaining the autoroute database across connections
+    // (maintain_database = true) is 2.6x SLOWER on the reference fixture, not faster --
+    // retained rooms are carved with search-specific context (ignore shapes, from-doors) and
+    // fragment monotonically, so later searches walk ~10x more expansion elements and some
+    // fail outright. Do not flip this without redesigning room construction to be
+    // context-free with periodic re-coarsening.
     this.retain_autoroute_database = false;
   }
 
@@ -480,7 +486,14 @@ public class BatchAutorouter extends NamedAlgorithm {
       int not_routed = 0;
       int routed = 0;
       int skipped = 0;
-      BoardStatistics stats = board.get_statistics();
+      // One incompletes analysis per pass start, shared between the statistics object and the
+      // counters. get_statistics() used to run its own identical DesignRulesChecker internally
+      // and discard it, so the same full-board scan (item scan + per-net Delaunay) ran twice.
+      DesignRulesChecker tempDrc = new DesignRulesChecker(board, null);
+      tempDrc.calculateAllIncompletes();
+      BoardStatistics stats = new BoardStatistics(board, null, true, false);
+      stats.connections.maximumCount = tempDrc.max_connections;
+      stats.connections.incompleteCount = tempDrc.getIncompleteCount();
       RouterCounters routerCounters = new RouterCounters();
       routerCounters.phase = "autoroute";
       routerCounters.passCount = p_pass_no;
@@ -489,8 +502,6 @@ public class BatchAutorouter extends NamedAlgorithm {
       routerCounters.rippedCount = ripped_item_count;
       routerCounters.failedToBeRoutedCount = not_routed;
       routerCounters.routedCount = routed;
-      DesignRulesChecker tempDrc = new DesignRulesChecker(board, null);
-      tempDrc.calculateAllIncompletes();
       routerCounters.incompleteCount = tempDrc.getIncompleteCount();
 
       // Log incomplete details for debugging
@@ -682,19 +693,25 @@ public class BatchAutorouter extends NamedAlgorithm {
             routerCounters.rippedCount = ripped_item_count;
             routerCounters.failedToBeRoutedCount = not_routed;
             routerCounters.routedCount = routed;
-            routerCounters.incompleteCount = calculateIncompleteCount(board);
+            // get_statistics() already ran the identical incompletes analysis; recomputing it
+            // with calculateIncompleteCount() doubled the cost of every progress event.
+            routerCounters.incompleteCount = boardStatistics.connections.incompleteCount;
             this.fireBoardUpdatedEvent(boardStatistics, routerCounters, this.board);
           }
         }
       }
 
-      int incompletesBefore = calculateIncompleteCount(board);
-      FRLogger.trace(
-          "BatchAutorouter.autoroute_pass",
-          "compare_trace_remove_tails",
-          "Incompletes before remove_tails=" + incompletesBefore,
-          "Autorouter pass #" + p_pass_no,
-          new Point[0]);
+      // These two counts feed trace logging only, and each is a full-board incompletes
+      // analysis -- skip both when trace logging is off.
+      if (FRLogger.isTraceEnabled()) {
+        int incompletesBefore = calculateIncompleteCount(board);
+        FRLogger.trace(
+            "BatchAutorouter.autoroute_pass",
+            "compare_trace_remove_tails",
+            "Incompletes before remove_tails=" + incompletesBefore,
+            "Autorouter pass #" + p_pass_no,
+            new Point[0]);
+      }
 
       if (this.remove_unconnected_vias) {
         remove_tails(Item.StopConnectionOption.NONE);
@@ -702,13 +719,15 @@ public class BatchAutorouter extends NamedAlgorithm {
         remove_tails(Item.StopConnectionOption.FANOUT_VIA);
       }
 
-      int incompletesAfter = calculateIncompleteCount(board);
-      FRLogger.trace(
-          "BatchAutorouter.autoroute_pass",
-          "compare_trace_remove_tails",
-          "Incompletes after remove_tails=" + incompletesAfter,
-          "Autorouter pass #" + p_pass_no,
-          new Point[0]);
+      if (FRLogger.isTraceEnabled()) {
+        int incompletesAfter = calculateIncompleteCount(board);
+        FRLogger.trace(
+            "BatchAutorouter.autoroute_pass",
+            "compare_trace_remove_tails",
+            "Incompletes after remove_tails=" + incompletesAfter,
+            "Autorouter pass #" + p_pass_no,
+            new Point[0]);
+      }
 
       // Fire final update for this pass
       BoardStatistics boardStatistics = board.get_statistics();
@@ -718,12 +737,13 @@ public class BatchAutorouter extends NamedAlgorithm {
       routerCounters.rippedCount = ripped_item_count;
       routerCounters.failedToBeRoutedCount = not_routed;
       routerCounters.routedCount = routed;
-      routerCounters.incompleteCount = calculateIncompleteCount(board);
+      routerCounters.incompleteCount = boardStatistics.connections.incompleteCount;
       this.fireBoardUpdatedEvent(boardStatistics, routerCounters, this.board);
 
       long passDuration = System.currentTimeMillis() - passStartTime;
       int currentRipupCost = this.start_ripup_costs * p_pass_no;
       PerformanceProfiler.recordPass(p_pass_no, routerCounters.incompleteCount, passDuration, currentRipupCost);
+
 
       // We are done with this pass
       this.air_line = null;
