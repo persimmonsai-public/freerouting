@@ -159,6 +159,12 @@ public class SortedRoomNeighbours {
         continue;
       }
       TileShape curr_shape = curr_object.get_tree_shape(p_autoroute_search_tree, curr_entry.shape_index_in_object);
+      if (curr_shape == null) {
+        // Stale-view conflict against a private scratch tree (see
+        // SearchTreeManager#build_scratch_search_tree) -- skip this candidate rather than crash
+        // on an entry another worker's commit invalidated.
+        continue;
+      }
       TileShape intersection = room_shape.intersection(curr_shape);
       int dimension = intersection.dimension();
       if (dimension > 1) {

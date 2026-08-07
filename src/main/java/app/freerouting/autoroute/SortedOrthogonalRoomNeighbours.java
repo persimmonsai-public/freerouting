@@ -133,6 +133,12 @@ public class SortedOrthogonalRoomNeighbours {
         continue;
       }
       TileShape curr_shape = curr_object.get_tree_shape(p_autoroute_search_tree, curr_entry.shape_index_in_object);
+      if (curr_shape == null) {
+        // Stale-view conflict against a private scratch tree (see
+        // SearchTreeManager#build_scratch_search_tree) -- skip this candidate rather than abort
+        // the whole neighbour calculation over one entry another worker's commit invalidated.
+        continue;
+      }
       if (!(curr_shape instanceof IntBox curr_box)) {
         FRLogger.warn("OrthogonalAutorouteEngine:calculate_sorted_neighbours: IntBox expected for curr_shape");
         return null;

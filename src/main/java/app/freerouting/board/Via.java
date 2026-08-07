@@ -43,9 +43,19 @@ public class Via extends DrillItem implements Serializable {
   private Padstack padstack;
   private transient Shape[] precalculated_shapes;
   /**
-   * Temporary data used in the autoroute algorithm.
+   * Per-search drill expansion data, kept per-thread.
+   *
+   * <p>Two reasons, not one. It is derived from the {@code ShapeSearchTree} passed to
+   * {@link #get_autoroute_drill_info}, and under the parallel router each worker searches
+   * against its own tree -- so a single shared value would hand one worker data computed for
+   * another worker's tree. And as a lazily-initialised shared field it raced outright:
+   * concurrent searches would null it via {@code clear_autoroute_info} while another was mid
+   * way through filling {@code room_arr}, throwing NullPointerException inside the maze search.
+   *
+   * <p>Not a field initializer: Via is restored by deserialization, which skips initializers
+   * for transient fields; created lazily in {@code autoroute_drill_info_holder()} instead.
    */
-  private transient ExpansionDrill autoroute_drill_info;
+  private transient ThreadLocal<ExpansionDrill> autoroute_drill_info;
 
   /**
    * Creates a new instance of Via with the input parameters
@@ -179,29 +189,43 @@ public class Via extends DrillItem implements Serializable {
   }
 
   public ExpansionDrill get_autoroute_drill_info(ShapeSearchTree p_autoroute_tree) {
-    if (this.autoroute_drill_info == null) {
+    ThreadLocal<ExpansionDrill> holder = autoroute_drill_info_holder();
+    ExpansionDrill drill_info = holder.get();
+    if (drill_info == null) {
       ItemAutorouteInfo via_autoroute_info = this.get_autoroute_info();
       TileShape curr_drill_shape = TileShape.get_instance(this.get_center());
-      this.autoroute_drill_info = new ExpansionDrill(curr_drill_shape, this.get_center(), this.first_layer(), this.last_layer());
+      drill_info = new ExpansionDrill(curr_drill_shape, this.get_center(), this.first_layer(), this.last_layer());
       int via_layer_count = this.last_layer() - this.first_layer() + 1;
       for (int i = 0; i < via_layer_count; i++) {
-        this.autoroute_drill_info.room_arr[i] = via_autoroute_info.get_expansion_room(i, p_autoroute_tree);
+        drill_info.room_arr[i] = via_autoroute_info.get_expansion_room(i, p_autoroute_tree);
       }
+      // Published only once fully built, and into a local first, so no other thread can observe
+      // a half-populated room_arr and no concurrent clear can null it out mid-construction.
+      holder.set(drill_info);
     }
-    return this.autoroute_drill_info;
+    return drill_info;
+  }
+
+  private ThreadLocal<ExpansionDrill> autoroute_drill_info_holder() {
+    ThreadLocal<ExpansionDrill> holder = this.autoroute_drill_info;
+    if (holder == null) {
+      holder = new ThreadLocal<>();
+      this.autoroute_drill_info = holder;
+    }
+    return holder;
   }
 
   @Override
   public void clear_derived_data() {
     super.clear_derived_data();
     this.precalculated_shapes = null;
-    this.autoroute_drill_info = null;
+    autoroute_drill_info_holder().remove();
   }
 
   @Override
   public void clear_autoroute_info() {
     super.clear_autoroute_info();
-    this.autoroute_drill_info = null;
+    autoroute_drill_info_holder().remove();
   }
 
   @Override

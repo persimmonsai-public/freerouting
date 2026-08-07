@@ -187,6 +187,14 @@ public class CompleteFreeSpaceExpansionRoom extends FreeSpaceExpansionRoom imple
         continue;
       }
       TileShape curr_shape = curr_object.get_tree_shape(p_autoroute_engine.autoroute_search_tree, curr_entry.shape_index_in_object);
+      if (curr_shape == null) {
+        // The parallel autorouter searches against a private, point-in-time tree snapshot
+        // (see SearchTreeManager#build_scratch_search_tree); by the time this runs, another
+        // worker's commit may have legitimately changed curr_object's shape count/geometry.
+        // That's a stale-view conflict, not a bug -- skip this candidate rather than crash on
+        // it; commit-time re-validation is what actually guards board correctness.
+        continue;
+      }
       TileShape intersection = this.get_shape().intersection(curr_shape);
       if (intersection.dimension() > 1) {
         FRLogger.warn("ExpansionRoom overlap conflict");

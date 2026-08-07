@@ -8,6 +8,7 @@ import app.freerouting.logger.FRLogger;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.util.concurrent.locks.StampedLock;
 
 /**
  * The SearchTreeManager manages the search trees used in the auto-router. It is
@@ -22,6 +23,44 @@ public class SearchTreeManager {
   private final BasicBoard board;
   private ShapeSearchTree default_tree;
   private boolean clearance_compensation_used;
+
+  /**
+   * Guards the real/shared search trees (the ones in {@link #compensated_search_trees})
+   * against concurrent access from parallel autorouting workers (see
+   * {@code BatchAutorouter#autoroute_pass_parallel}). Readers are single-threaded interactive
+   * callers and the commit-time re-validation check; writers are {@link #insert}/{@link #remove}
+   * and the other tree-mutating helpers below. Parallel workers never call these directly during
+   * their own maze search -- each worker searches against a private, unshared
+   * {@link #build_scratch_search_tree} snapshot instead, so this lock is only contended at
+   * commit time, not during the CPU-heavy search phase.
+   */
+  private final StampedLock concurrencyLock = new StampedLock();
+
+  /**
+   * Acquires the lock that must be held while a parallel worker reads the real search trees
+   * for commit-time re-validation (e.g. checking whether a candidate path still overlaps only
+   * the items it planned to rip up). Must be paired with {@link #releaseReadLock}.
+   */
+  public long acquireReadLock() {
+    return concurrencyLock.readLock();
+  }
+
+  public void releaseReadLock(long p_stamp) {
+    concurrencyLock.unlockRead(p_stamp);
+  }
+
+  /**
+   * Acquires the lock that must be held around any mutation of the real search trees
+   * (rip-up removal followed by trace/via insertion) when multiple autorouting workers may be
+   * running concurrently. Must be paired with {@link #releaseWriteLock}.
+   */
+  public long acquireWriteLock() {
+    return concurrencyLock.writeLock();
+  }
+
+  public void releaseWriteLock(long p_stamp) {
+    concurrencyLock.unlockWrite(p_stamp);
+  }
 
   /**
    * Creates a new instance of SearchTreeManager
@@ -180,6 +219,55 @@ public class SearchTreeManager {
       curr_autoroute_tree.insert(curr_item);
     }
     return curr_autoroute_tree;
+  }
+
+  /**
+   * Builds a private, unshared search tree for clearance class p_clearance_class_no,
+   * pre-populated with a snapshot of the board's current items. Unlike
+   * {@link #get_autoroute_tree}, the returned tree is NOT registered in
+   * {@link #compensated_search_trees} -- it belongs exclusively to the caller.
+   *
+   * <p>This exists for parallel autorouting: {@code MazeSearchAlgo}'s wavefront expansion does
+   * not just read the search tree, it also inserts/removes temporary
+   * {@code CompleteFreeSpaceExpansionRoom} bookkeeping into it as it explores (see
+   * {@code AutorouteEngine.add_complete_room}). Two worker threads searching against the SAME
+   * physical tree would corrupt each other's room bookkeeping and each other's tree structure
+   * (the underlying {@code MinAreaTree} rewrites ancestor pointers/bounds in place on every
+   * insert). Giving each worker its own snapshot tree makes the search phase itself lock-free:
+   * only the final commit (rip-up + insert of the real trace/via) needs to touch the shared
+   * trees, under {@link #acquireWriteLock}.
+   *
+   * <p>The snapshot is taken under a brief read lock so it reflects a consistent view of the
+   * board, but it is not kept in sync afterwards -- by the time a worker finishes a search, other
+   * threads may have committed changes that make the result stale. That's expected: the caller
+   * must re-validate against the real trees at commit time.
+   */
+  public ShapeSearchTree build_scratch_search_tree(int p_clearance_class_no) {
+    ShapeSearchTree scratch_tree;
+    if (this.board.rules.get_trace_angle_restriction() == AngleRestriction.NINETY_DEGREE) {
+      scratch_tree = new ShapeSearchTree90Degree(this.board, p_clearance_class_no);
+    } else if (this.board.rules.get_trace_angle_restriction() == AngleRestriction.FORTYFIVE_DEGREE) {
+      scratch_tree = new ShapeSearchTree45Degree(this.board, p_clearance_class_no);
+    } else {
+      scratch_tree = new ShapeSearchTree(FortyfiveDegreeBoundingDirections.INSTANCE, this.board,
+          p_clearance_class_no);
+    }
+    scratch_tree.isPrivateScratchTree = true;
+
+    long stamp = acquireReadLock();
+    try {
+      Iterator<UndoableObjects.UndoableObjectNode> it = this.board.item_list.start_read_object();
+      for (;;) {
+        Item curr_item = (Item) this.board.item_list.read_object(it);
+        if (curr_item == null) {
+          break;
+        }
+        scratch_tree.insert(curr_item);
+      }
+    } finally {
+      releaseReadLock(stamp);
+    }
+    return scratch_tree;
   }
 
   // ********************************************************************************

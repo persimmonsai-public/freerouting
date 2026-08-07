@@ -3,6 +3,8 @@ package app.freerouting.board;
 import app.freerouting.datastructures.IdentificationNumberGenerator;
 import app.freerouting.logger.FRLogger;
 import java.io.Serializable;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Creates unique identification numbers for items on the board with overflow protection built-in.
@@ -23,12 +25,18 @@ import java.io.Serializable;
 public class ItemIdentificationNumberGenerator implements IdentificationNumberGenerator, Serializable {
 
   private static final int c_max_id_no = Integer.MAX_VALUE / 2;
-  private int last_generated_id_no;
+  /**
+   * Atomic so that IDs stay unique even if a caller ever creates items from more than one
+   * thread without going through the parallel autorouter's own commit lock (which already
+   * serializes item creation, but this removes the reliance on that discipline holding
+   * everywhere, forever).
+   */
+  private final AtomicInteger last_generated_id_no = new AtomicInteger(0);
   /**
    * Tracks how many times the counter has wrapped around (for diagnostics).
    * {@code long} is used so the diagnostic counter itself never overflows.
    */
-  private long wrapAroundCount;
+  private final AtomicLong wrapAroundCount = new AtomicLong(0);
 
   /**
    * Creates a new ItemIdentificationNumberGenerator.
@@ -41,19 +49,28 @@ public class ItemIdentificationNumberGenerator implements IdentificationNumberGe
    */
   @Override
   public int new_no() {
-    if (last_generated_id_no >= c_max_id_no) {
+    boolean[] wrapped = new boolean[1];
+    int next = last_generated_id_no.updateAndGet(prev -> {
+      // updateAndGet may re-invoke this function on CAS contention; reset the flag each time
+      // so a stale true from an earlier, superseded attempt can't leak into the result.
+      if (prev >= c_max_id_no) {
+        wrapped[0] = true;
+        return 1;
+      }
+      wrapped[0] = false;
+      return prev + 1;
+    });
+    if (wrapped[0]) {
       // Wrap around to 1 instead of overflowing into negative territory.
       // Emit a single warning per wrap so the log is not flooded.
-      wrapAroundCount++;
+      long wraps = wrapAroundCount.incrementAndGet();
       FRLogger.warn("IdNoGenerator: ID counter reached " + c_max_id_no
-          + " and wrapped around to 1 (wrap #" + wrapAroundCount + ")."
+          + " and wrapped around to 1 (wrap #" + wraps + ")."
           + " IDs that were previously assigned to now-deleted items may be"
           + " assigned again to newly created items."
           + " Consider restarting the router to regenerate IDs from scratch.");
-      last_generated_id_no = 0;
     }
-    ++last_generated_id_no;
-    return last_generated_id_no;
+    return next;
   }
 
   /**
@@ -61,6 +78,6 @@ public class ItemIdentificationNumberGenerator implements IdentificationNumberGe
    */
   @Override
   public int max_generated_no() {
-    return last_generated_id_no;
+    return last_generated_id_no.get();
   }
 }

@@ -111,6 +111,12 @@ public class Sorted45DegreeRoomNeighbours {
         continue;
       }
       TileShape curr_shape = curr_object.get_tree_shape(p_autoroute_search_tree, curr_entry.shape_index_in_object);
+      if (curr_shape == null) {
+        // Stale-view conflict against a private scratch tree (see
+        // SearchTreeManager#build_scratch_search_tree) -- skip this candidate rather than crash
+        // on an entry another worker's commit invalidated.
+        continue;
+      }
       IntOctagon curr_oct = curr_shape.bounding_octagon();
       IntOctagon intersection = room_oct.intersection(curr_oct);
       int dimension = intersection.dimension();

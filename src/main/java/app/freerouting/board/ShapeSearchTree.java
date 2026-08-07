@@ -52,6 +52,15 @@ public class ShapeSearchTree extends MinAreaTree {
   public final int compensated_clearance_class_no;
   public final String key;
   protected final BasicBoard board;
+  /**
+   * True for a private, per-worker search-tree snapshot built by
+   * {@code SearchTreeManager#build_scratch_search_tree} for the parallel autorouter. Such a
+   * tree's items are frozen at snapshot time -- its structural expectations (shape counts,
+   * indices) must never be invalidated by another thread's later, unrelated board mutation.
+   * See {@code ItemSearchTreesInfo#clear_precalculated_tree_shapes}, which checks this to decide
+   * which trees' cached shapes a board mutation is allowed to wipe.
+   */
+  public boolean isPrivateScratchTree = false;
 
   /**
    * Creates a new ShapeSearchTree. p_compensated_clearance_class_no is the
@@ -577,7 +586,7 @@ public class ShapeSearchTree extends MinAreaTree {
     // in a deterministic order. The non-deterministic order of tree traversal
     // causes different room partitioning.
     List<Leaf> overlapping_leaves = new LinkedList<>();
-    ArrayStack<TreeNode> node_stack = new ArrayStack<>(10000);
+    ArrayStack<TreeNode> node_stack = new ArrayStack<>(QUERY_STACK_INITIAL_CAPACITY);
     node_stack.push(this.root);
     TreeNode curr_node;
     int room_layer = p_room.get_layer();

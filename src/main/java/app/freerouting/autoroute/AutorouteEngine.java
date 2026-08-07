@@ -7,10 +7,12 @@ import app.freerouting.board.ShapeSearchTree;
 import app.freerouting.board.ShapeSearchTree45Degree;
 import app.freerouting.board.ShapeSearchTree90Degree;
 import app.freerouting.boardgraphics.GraphicsContext;
+import app.freerouting.datastructures.ShapeTree;
 import app.freerouting.datastructures.Stoppable;
 import app.freerouting.datastructures.TimeLimit;
 import app.freerouting.geometry.planar.IntBox;
 import app.freerouting.geometry.planar.Line;
+import app.freerouting.geometry.planar.Polyline;
 import app.freerouting.geometry.planar.Simplex;
 import app.freerouting.geometry.planar.TileShape;
 import app.freerouting.logger.FRLogger;
@@ -80,10 +82,24 @@ public class AutorouteEngine {
    * performance reasons.
    */
   public AutorouteEngine(RoutingBoard p_board, int p_trace_clearance_class_no, boolean p_maintain_database) {
+    this(p_board, p_board.search_tree_manager.get_autoroute_tree(p_trace_clearance_class_no), p_maintain_database);
+  }
+
+  /**
+   * Creates a new instance of BoardAutorouteEngine that searches against p_search_tree instead
+   * of looking one up (and caching it) via {@code p_board.search_tree_manager}.
+   *
+   * <p>Used by the parallel autorouter ({@code BatchAutorouter#autoroute_pass_parallel}), where
+   * each worker thread searches against its own private
+   * {@link app.freerouting.board.SearchTreeManager#build_scratch_search_tree} snapshot rather
+   * than the board's shared tree -- search mutates the tree it's given (temporary expansion-room
+   * bookkeeping), so concurrent workers must never share one.
+   */
+  public AutorouteEngine(RoutingBoard p_board, ShapeSearchTree p_search_tree, boolean p_maintain_database) {
     this.board = p_board;
     this.maintain_database = p_maintain_database;
     this.net_no = -1;
-    this.autoroute_search_tree = p_board.search_tree_manager.get_autoroute_tree(p_trace_clearance_class_no);
+    this.autoroute_search_tree = p_search_tree;
     int max_drill_page_width = (int) (5 * p_board.rules.get_default_via_diameter());
     max_drill_page_width = Math.max(max_drill_page_width, 10000);
     this.drill_page_array = new DrillPageArray(this.board, max_drill_page_width);
@@ -126,6 +142,78 @@ public class AutorouteEngine {
    */
   public AutorouteAttemptResult autoroute_connection(Set<Item> p_start_set, Set<Item> p_dest_set,
       AutorouteControl p_ctrl, SortedSet<Item> p_ripped_item_list, Map<Item, Integer> p_ripup_costs) {
+    ConnectionPlan plan = search_connection(p_start_set, p_dest_set, p_ctrl, p_ripped_item_list, p_ripup_costs);
+    if (plan.failure != null) {
+      return plan.failure;
+    }
+    return commit_connection(plan, p_ctrl, p_ripped_item_list);
+  }
+
+  /**
+   * A route found by the maze search but not yet written to the board.
+   *
+   * <p>Separating "search" from "commit" is what makes parallel autorouting sound: workers can
+   * search concurrently only while nothing is mutating the board, because the search reads live
+   * {@code Item} geometry (trace shape counts, contacts) far beyond the search tree itself. The
+   * caller runs all searches first, then commits the resulting plans one at a time.
+   *
+   * <p>{@link #route_box} bounds the geometry this plan intends to add. Two plans whose boxes do
+   * not intersect cannot invalidate one another, which is what lets a batch of independently
+   * searched plans be committed without re-running their searches.
+   */
+  public static final class ConnectionPlan {
+
+    /** The located connection, or null when the search failed. */
+    public final LocateFoundConnectionAlgo located;
+    /** Non-null exactly when {@link #located} is null: why the search produced nothing. */
+    public final AutorouteAttemptResult failure;
+    /** Bounding box of the geometry this plan would insert; null when the search failed. */
+    public final IntBox route_box;
+
+    private ConnectionPlan(LocateFoundConnectionAlgo p_located, AutorouteAttemptResult p_failure, IntBox p_route_box) {
+      this.located = p_located;
+      this.failure = p_failure;
+      this.route_box = p_route_box;
+    }
+
+    static ConnectionPlan failed(AutorouteAttemptResult p_failure) {
+      return new ConnectionPlan(null, p_failure, null);
+    }
+
+    static ConnectionPlan found(LocateFoundConnectionAlgo p_located, IntBox p_route_box) {
+      return new ConnectionPlan(p_located, null, p_route_box);
+    }
+  }
+
+  /**
+   * Bounding box over every corner of a located connection, or null if it has no geometry.
+   */
+  private static IntBox route_bounding_box(LocateFoundConnectionAlgo p_located) {
+    IntBox result = null;
+    for (LocateFoundConnectionAlgo.ResultItem curr_item : p_located.connection_items) {
+      if (curr_item.corners == null) {
+        continue;
+      }
+      for (app.freerouting.geometry.planar.IntPoint curr_corner : curr_item.corners) {
+        IntBox corner_box = new IntBox(curr_corner, curr_corner);
+        result = (result == null) ? corner_box : result.union(corner_box);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Same as {@link #autoroute_connection(Set, Set, AutorouteControl, SortedSet, Map)}, but for
+   * use by parallel autorouting workers: when p_concurrency_manager is non-null, the commit
+   * (rip-up removal + trace/via insertion, a few lines below) runs under its write lock, with a
+   * re-validation check first -- another worker may have already ripped up one of the items this
+   * search planned to rip up, in which case this attempt is abandoned as a retryable conflict
+   * rather than corrupting the board. When p_concurrency_manager is null (the normal
+   * single-threaded caller), behavior is identical to the overload above -- no locking, no
+   * re-validation, zero added cost.
+   */
+  public ConnectionPlan search_connection(Set<Item> p_start_set, Set<Item> p_dest_set,
+      AutorouteControl p_ctrl, SortedSet<Item> p_ripped_item_list, Map<Item, Integer> p_ripup_costs) {
     String sourceItems = String.join(", ", p_start_set
         .stream()
         .map(Item::toString)
@@ -144,9 +232,9 @@ public class AutorouteEngine {
     }
 
     if (maze_search_algo == null) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
+      return ConnectionPlan.failed(new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
           "Failed to route connection between " + sourceItems + " and " + targetItems
-              + ", because the maze search algorithm could not be created.");
+              + ", because the maze search algorithm could not be created."));
     }
 
     MazeSearchAlgo.Result search_result = null;
@@ -189,26 +277,58 @@ public class AutorouteEngine {
     }
 
     if (search_result == null) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
+      return ConnectionPlan.failed(new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
           "Failed to route connection between " + sourceItems + " and " + targetItems
-              + ", because no connection was found between their nets.");
+              + ", because no connection was found between their nets."));
     }
 
     if (autoroute_result == null) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
-          "Failed to route connection between " + sourceItems + " and " + targetItems + ".");
+      return ConnectionPlan.failed(new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
+          "Failed to route connection between " + sourceItems + " and " + targetItems + "."));
     }
 
     if (!p_ctrl.layer_active[autoroute_result.start_layer] || !p_ctrl.layer_active[autoroute_result.target_layer]) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED, "Failed to route connection between "
-          + sourceItems + " and " + targetItems + ", because some of their layers are disabled.");
+      return ConnectionPlan.failed(new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
+          "Failed to route connection between " + sourceItems + " and " + targetItems
+              + ", because some of their layers are disabled."));
     }
 
     if (autoroute_result.connection_items == null) {
-      FRLogger.debug("AutorouteEngine.autoroute_connection: result_items != null expected");
-      return new AutorouteAttemptResult(AutorouteAttemptState.SKIPPED,
-          "No new connections were made between " + sourceItems + " and " + targetItems + ".");
+      FRLogger.debug("AutorouteEngine.search_connection: result_items != null expected");
+      return ConnectionPlan.failed(new AutorouteAttemptResult(AutorouteAttemptState.SKIPPED,
+          "No new connections were made between " + sourceItems + " and " + targetItems + "."));
     }
+
+    // Search half ends here: nothing above this point mutates the board.
+    return ConnectionPlan.found(autoroute_result, route_bounding_box(autoroute_result));
+  }
+
+  /**
+   * Writes a plan produced by {@link #search_connection} to the board.
+   *
+   * <p>The caller must guarantee exclusive access -- this mutates shared board state. It does
+   * NOT re-check that the plan is still valid; a caller committing plans that were searched
+   * against an older board (the parallel router) is responsible for that, because only it knows
+   * what has changed since.
+   */
+  public AutorouteAttemptResult commit_connection(ConnectionPlan p_plan, AutorouteControl p_ctrl,
+      SortedSet<Item> p_ripped_item_list) {
+    return commit_connection(p_plan, p_ctrl, p_ripped_item_list, false);
+  }
+
+  /**
+   * As above, but when p_validate_against_board is set the plan's geometry is first re-checked
+   * against the board as it stands right now.
+   *
+   * <p>Required by the parallel router: a plan is searched against the board as it was at the
+   * start of its batch, so by commit time another connection may already occupy the space it
+   * wants. Without this check that stale plan is inserted anyway and the board ends up with
+   * overlapping copper -- observed as intermittent DRC violations. Items this plan is about to
+   * rip up are excluded, since they will be gone by the time the new trace exists.
+   */
+  public AutorouteAttemptResult commit_connection(ConnectionPlan p_plan, AutorouteControl p_ctrl,
+      SortedSet<Item> p_ripped_item_list, boolean p_validate_against_board) {
+    LocateFoundConnectionAlgo autoroute_result = p_plan.located;
 
     // Delete the ripped connections.
     SortedSet<Item> ripped_connections = new TreeSet<>();
@@ -225,6 +345,14 @@ public class AutorouteEngine {
       for (int i = 0; i < curr_ripped_item.net_count(); i++) {
         changed_nets.add(curr_ripped_item.get_net_no(i));
       }
+    }
+
+    if (p_validate_against_board
+        && !planned_geometry_is_still_free(autoroute_result, p_ctrl, ripped_connections)) {
+      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
+          "CONCURRENT_CONFLICT: the located route is no longer clear on the current board; "
+              + "another connection was committed into that space while this one was being "
+              + "searched. Deferring it to the next pass.");
     }
 
     // let the observers know the changes in the board database.
@@ -246,11 +374,87 @@ public class AutorouteEngine {
     }
     if (insert_found_connection_algo == null) {
       return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
-          "Failed to route connection between " + sourceItems + " and " + targetItems
-              + ", because the new connection could not be inserted.");
+          "Failed to insert the located connection into the board.");
     }
 
     return new AutorouteAttemptResult(AutorouteAttemptState.ROUTED);
+  }
+
+  /**
+   * Whether the geometry this plan wants to add is still unoccupied on the live board.
+   *
+   * <p>Each segment of each located trace is tested as an axis-aligned box inflated by the
+   * compensated trace half-width. That over-approximates the real trace shape, so the check can
+   * refuse a route that would actually have fitted -- the cost of that is one deferred
+   * connection, retried next pass, which is far cheaper than admitting overlapping copper.
+   *
+   * <p>Items in p_ripped_connections are ignored because this commit removes them, and items
+   * that are not obstacles to this net (its own traces and pads) are ignored as usual.
+   */
+  private boolean planned_geometry_is_still_free(LocateFoundConnectionAlgo p_located,
+      AutorouteControl p_ctrl, SortedSet<Item> p_ripped_connections) {
+    ShapeSearchTree default_tree = board.search_tree_manager.get_default_tree();
+    int[] ignore_net_nos = new int[0];
+    for (LocateFoundConnectionAlgo.ResultItem curr_item : p_located.connection_items) {
+      if (curr_item.corners == null || curr_item.corners.length < 2) {
+        continue;
+      }
+      if (curr_item.layer < 0 || curr_item.layer >= p_ctrl.trace_half_width.length) {
+        continue;
+      }
+      // The exact tile shapes the trace would occupy -- the same ones the search tree would
+      // store for it. An earlier version approximated each segment with its axis-aligned
+      // bounding box, which on a 45-degree board is far larger than the trace itself and
+      // rejected the large majority of otherwise-valid plans.
+      TileShape[] trace_shapes;
+      try {
+        Polyline trace_polyline = new Polyline(curr_item.corners);
+        trace_shapes = default_tree.offset_shapes(trace_polyline, p_ctrl.trace_half_width[curr_item.layer],
+            0, trace_polyline.arr.length - 1);
+      } catch (Exception e) {
+        // Degenerate corner list -- let the insert itself decide, rather than guessing here.
+        continue;
+      }
+      for (TileShape curr_shape : trace_shapes) {
+        if (curr_shape == null || curr_shape.is_empty()) {
+          continue;
+        }
+        // This overload picks the compensated or clearance-aware query itself, matching what
+        // BasicBoard.check_trace_shape does for an ordinary insert.
+        Collection<ShapeTree.TreeEntry> tree_entries =
+            default_tree.overlapping_tree_entries_with_clearance(curr_shape, curr_item.layer,
+                ignore_net_nos, p_ctrl.trace_clearance_class_no);
+        for (ShapeTree.TreeEntry curr_entry : tree_entries) {
+          if (!(curr_entry.object instanceof Item overlapping_item)) {
+            continue;
+          }
+          if (p_ripped_connections.contains(overlapping_item)) {
+            continue;
+          }
+          if (!overlapping_item.is_trace_obstacle(p_ctrl.net_no)) {
+            continue;
+          }
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Whether every item this plan intends to rip up is still on the board.
+   *
+   * <p>Cheap half of the staleness check for a plan searched against an older board: if another
+   * commit already removed one of these, the plan's rip-up accounting no longer describes
+   * reality and it must be re-searched rather than committed.
+   */
+  public static boolean ripped_items_still_present(SortedSet<Item> p_ripped_item_list) {
+    for (Item curr_ripped_item : p_ripped_item_list) {
+      if (!curr_ripped_item.is_on_the_board()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

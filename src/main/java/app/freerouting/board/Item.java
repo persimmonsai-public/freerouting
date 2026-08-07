@@ -57,8 +57,15 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
   private int clearance_class;
   /**
    * points to the entries of this item in the ShapeSearchTrees
+   *
+   * <p>volatile: when the parallel autorouter is active, one thread's commit (which clears or
+   * replaces this reference on rip-up / insert, under the search-tree write lock) can run
+   * concurrently with another thread's maze search reading it via {@link #get_search_tree_entries}
+   * for a private scratch tree. volatile guarantees the reader either sees the old, fully-formed
+   * object or the new one -- never a torn/partially-constructed reference -- without requiring
+   * the read path itself to take a lock.
    */
-  private transient ItemSearchTreesInfo search_trees_info;
+  private transient volatile ItemSearchTreesInfo search_trees_info;
   private FixedState fixed_state;
   /**
    * False, if the item is deleted or not inserted into the board
@@ -66,8 +73,36 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
   private boolean on_the_board;
   /**
    * Temporary data used in the autoroute algorithm.
+   *
+   * <p>ThreadLocal: when the parallel autorouter is active, each worker searches with its own
+   * private {@code ShapeSearchTree} (see {@code SearchTreeManager#build_scratch_search_tree}),
+   * but {@code ItemAutorouteInfo} caches per-tree {@code ObstacleExpansionRoom}/door bookkeeping
+   * keyed only by item+shape-index, not by which tree asked for it. A single shared field here
+   * let two workers' concurrent searches race on constructing/mutating the SAME cached rooms for
+   * the same nearby item -- surfaced in testing as a {@code ConcurrentModificationException} in
+   * {@code AutorouteEngine.complete_neighbour_rooms}, not as corrupted board geometry (the actual
+   * board mutation is separately protected -- see {@code SearchTreeManager}'s lock -- but this
+   * search-scratch cache was not). Giving each thread its own view fixes that at the root: it's
+   * temporary, search-scoped data by design (see {@code AutorouteEngine#clear}), so per-thread
+   * lifetime is exactly correct, not just a workaround. In single-threaded (interactive)
+   * use this behaves identically to a plain field.
+   *
+   * <p>Deliberately NOT a field initializer / not final: {@code Item} instances are restored via
+   * plain Java deserialization (e.g. {@code RoutingBoard.deepCopy}), which skips field
+   * initializers for transient fields entirely -- an initializer here would silently leave this
+   * null (not a fresh ThreadLocal) on every deserialized item. Lazily created on first use below,
+   * same as {@code search_trees_info} just above.
    */
-  private transient ItemAutorouteInfo autoroute_info;
+  private transient ThreadLocal<ItemAutorouteInfo> autoroute_info;
+
+  private ThreadLocal<ItemAutorouteInfo> autoroute_info_thread_local() {
+    ThreadLocal<ItemAutorouteInfo> local = this.autoroute_info;
+    if (local == null) {
+      local = new ThreadLocal<>();
+      this.autoroute_info = local;
+    }
+    return local;
+  }
 
   Item(int[] p_net_no_arr, int p_clearance_type, int p_id_no, int p_component_no, FixedState p_fixed_state, BasicBoard p_board) {
     if (p_net_no_arr == null) {
@@ -201,13 +236,20 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
   }
 
   private TileShape[] get_precalculated_tree_shapes(ShapeTree p_tree) {
-    if (this.search_trees_info == null) {
-      this.search_trees_info = new ItemSearchTreesInfo();
+    // Read-then-use a single local reference throughout (see search_trees_info's javadoc): a
+    // concurrent commit on another thread can null out or replace the field at any point.
+    // A benign lost-update race remains possible here (two threads both see null and each
+    // allocate their own ItemSearchTreesInfo, one overwriting the other's) -- that just costs a
+    // recomputation, never a crash or wrong geometry, so it is not worth locking for.
+    ItemSearchTreesInfo info = this.search_trees_info;
+    if (info == null) {
+      info = new ItemSearchTreesInfo();
+      this.search_trees_info = info;
     }
-    TileShape[] precalculated_tree_shapes = this.search_trees_info.get_precalculated_tree_shapes(p_tree);
+    TileShape[] precalculated_tree_shapes = info.get_precalculated_tree_shapes(p_tree);
     if (precalculated_tree_shapes == null) {
       precalculated_tree_shapes = this.calculate_tree_shapes((ShapeSearchTree) p_tree);
-      this.search_trees_info.set_precalculated_tree_shapes(precalculated_tree_shapes, p_tree);
+      info.set_precalculated_tree_shapes(precalculated_tree_shapes, p_tree);
     }
     return precalculated_tree_shapes;
   }
@@ -1015,20 +1057,26 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
     if (this.board == null) {
       return;
     }
-    if (this.search_trees_info == null) {
-      this.search_trees_info = new ItemSearchTreesInfo();
+    ItemSearchTreesInfo info = this.search_trees_info;
+    if (info == null) {
+      info = new ItemSearchTreesInfo();
+      this.search_trees_info = info;
     }
-    this.search_trees_info.set_tree_entries(p_tree_entries, p_tree);
+    info.set_tree_entries(p_tree_entries, p_tree);
   }
 
   /**
    * Returns the tree entries for the tree with identification number p_tree_no, or null, if for this tree no entries of this item are inserted.
    */
   public ShapeTree.Leaf[] get_search_tree_entries(ShapeSearchTree p_tree) {
-    if (this.search_trees_info == null) {
+    // Read the field into a local exactly once: search_trees_info can be reassigned or nulled
+    // out concurrently by another thread's commit (see the field's javadoc), and re-reading the
+    // field between the null check and the call below would risk a NullPointerException.
+    ItemSearchTreesInfo info = this.search_trees_info;
+    if (info == null) {
       return null;
     }
-    return this.search_trees_info.get_tree_entries(p_tree);
+    return info.get_tree_entries(p_tree);
   }
 
   /**
@@ -1038,42 +1086,54 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
     if (this.board == null) {
       return;
     }
-    if (this.search_trees_info == null) {
+    ItemSearchTreesInfo info = this.search_trees_info;
+    if (info == null) {
       FRLogger.warn("Item.set_precalculated_tree_shapes search_trees_info not allocated");
       return;
     }
-    this.search_trees_info.set_precalculated_tree_shapes(p_shapes, p_tree);
+    info.set_precalculated_tree_shapes(p_shapes, p_tree);
   }
 
   /**
    * Sets the search tree entries of this item to null.
    */
   public void clear_search_tree_entries() {
-    this.search_trees_info = null;
+    ItemSearchTreesInfo info = this.search_trees_info;
+    if (info == null) {
+      return;
+    }
+    // Keep any private per-worker scratch-tree entries alive rather than nulling this whole
+    // object -- see ItemSearchTreesInfo#retain_only_private_scratch_tree_entries.
+    if (!info.retain_only_private_scratch_tree_entries()) {
+      this.search_trees_info = null;
+    }
   }
 
   /**
    * Gets the information for the autoroute algorithm. Creates it, if it does not yet exist.
    */
   public ItemAutorouteInfo get_autoroute_info() {
-    if (autoroute_info == null) {
-      autoroute_info = new ItemAutorouteInfo(this);
+    ThreadLocal<ItemAutorouteInfo> local = autoroute_info_thread_local();
+    ItemAutorouteInfo info = local.get();
+    if (info == null) {
+      info = new ItemAutorouteInfo(this);
+      local.set(info);
     }
-    return autoroute_info;
+    return info;
   }
 
   /**
    * Gets the information for the autoroute algorithm.
    */
   public ItemAutorouteInfo get_autoroute_info_pur() {
-    return autoroute_info;
+    return autoroute_info_thread_local().get();
   }
 
   /**
    * Clears the data allocated for the autoroute algorithm.
    */
   public void clear_autoroute_info() {
-    autoroute_info = null;
+    autoroute_info_thread_local().remove();
   }
 
   /**
@@ -1083,7 +1143,7 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
     if (this.search_trees_info != null) {
       this.search_trees_info.clear_precalculated_tree_shapes();
     }
-    autoroute_info = null;
+    autoroute_info_thread_local().remove();
   }
 
   /**

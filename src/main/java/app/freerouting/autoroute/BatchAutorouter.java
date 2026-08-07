@@ -13,6 +13,8 @@ import app.freerouting.board.Item;
 import app.freerouting.board.Pin;
 import app.freerouting.board.PolylineTrace;
 import app.freerouting.board.RoutingBoard;
+import app.freerouting.board.SearchTreeManager;
+import app.freerouting.board.ShapeSearchTree;
 import app.freerouting.board.Trace;
 import app.freerouting.board.Via;
 import app.freerouting.core.RouterCounters;
@@ -26,6 +28,7 @@ import app.freerouting.drc.AirLine;
 import app.freerouting.drc.DesignRulesChecker;
 import app.freerouting.geometry.planar.FloatLine;
 import app.freerouting.geometry.planar.FloatPoint;
+import app.freerouting.geometry.planar.IntBox;
 import app.freerouting.geometry.planar.Point;
 import app.freerouting.logger.FRLogger;
 import app.freerouting.rules.Net;
@@ -35,6 +38,7 @@ import java.lang.management.ManagementFactory;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -43,6 +47,11 @@ import java.util.Random;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Handles the sequencing of the auto-router passes.
@@ -428,7 +437,34 @@ public class BatchAutorouter extends NamedAlgorithm {
    * Auto-routes one ripup pass of all items of the board. Returns false, if the
    * board is already completely routed.
    */
+  /**
+   * Whether this pass should route items in parallel across multiple worker threads instead of
+   * one at a time. Gated behind the existing {@code featureFlags.multiThreading} toggle (already
+   * used to gate the route optimizer's own thread pool) and {@code settings.maxThreads > 1} so
+   * that single-threaded behavior (and its exact sequential/deterministic item ordering) remains
+   * the default unless a caller explicitly opts in.
+   *
+   * <p>Known limitations of the parallel path, kept out of scope for this first implementation:
+   * no strict-DRC snapshot/restore, no width-necking retry, no per-item airline/debug-trace
+   * output, and no cross-item ripup-cost accumulation ordering guarantee (results are not
+   * bit-for-bit reproducible run-to-run -- see {@code autoroute_pass_parallel}'s javadoc).
+   */
+
+
+  private boolean isParallelAutoroutingEnabled() {
+    return app.freerouting.Freerouting.globalSettings != null
+        // Opt-in and OFF by default -- see FeatureFlagsSettings#parallelAutorouter for the
+        // known commit-time race that has to be closed before this can be enabled generally.
+        && app.freerouting.Freerouting.globalSettings.featureFlags.parallelAutorouter
+        && app.freerouting.Freerouting.globalSettings.featureFlags.multiThreading
+        && this.settings.maxThreads != null
+        && this.settings.maxThreads > 1;
+  }
+
   private boolean autoroute_pass(int p_pass_no) {
+    if (isParallelAutoroutingEnabled()) {
+      return autoroute_pass_parallel(p_pass_no);
+    }
     long passStartTime = System.currentTimeMillis();
     try {
       List<Item> autoroute_item_list = getAutorouteItems(this.board);
@@ -512,7 +548,11 @@ public class BatchAutorouter extends NamedAlgorithm {
           // Use a fresh set per item to mirror v1.9 behavior and avoid cross-item side effects.
           SortedSet<Item> ripped_item_list = new TreeSet<>();
           Map<Item, Integer> ripped_item_costs = new LinkedHashMap<>();
-          int netItemsBefore = board.get_connectable_items(curr_item.get_net_no(i)).size();
+          // Full O(N) board scan whose only consumer is the trace-log block below, so it is
+          // only worth paying for when trace logging is actually on.
+          int netItemsBefore = FRLogger.isTraceEnabled()
+              ? board.get_connectable_items(curr_item.get_net_no(i)).size()
+              : 0;
           PerformanceProfiler.start("autoroute_item");
           var autorouterResult = autoroute_item(curr_item, curr_item.get_net_no(i), ripped_item_list, ripped_item_costs, p_pass_no);
           PerformanceProfiler.end("autoroute_item");
@@ -561,7 +601,9 @@ public class BatchAutorouter extends NamedAlgorithm {
                 getImpactedPoints(curr_item));
           }
 
-          if (curr_item.get_net_no(i) == 94) {
+          // Everything in this block only emits trace output, but it walks all of the net's
+          // items to do so -- skip the walk entirely when nothing will be logged.
+          if (FRLogger.isTraceEnabled() && curr_item.get_net_no(i) == 94) {
             FRLogger.trace(
                 "BatchAutorouter.autoroute_pass",
                 "compare_trace_dump_net_items",
@@ -691,6 +733,319 @@ public class BatchAutorouter extends NamedAlgorithm {
       this.air_line = null;
       return false;
     }
+  }
+
+  /**
+   * One (item, net) unit of work for the parallel pass -- the flattened equivalent of one
+   * iteration of the sequential pass's {@code for (Item curr_item ...) for (int i ...)} loop.
+   */
+  private record ItemNetWorkUnit(Item item, int net_no) {
+  }
+
+  /**
+   * Parallel counterpart of {@link #autoroute_pass}: routes the items of this pass across a
+   * pool of {@code settings.maxThreads} worker threads instead of one at a time.
+   *
+   * <p>Each worker searches against its own private, unshared search-tree snapshot (see
+   * {@link SearchTreeManager#build_scratch_search_tree}) built once per worker at the start of
+   * the pass -- so the CPU-heavy maze-search wavefront expansion runs fully lock-free and in
+   * parallel. Only the short commit step (rip-up removal + trace/via insertion, plus the
+   * subsequent pull-tight optimization) touches the real, shared board, and that is serialized
+   * under {@link SearchTreeManager}'s write lock with a re-validation check (see
+   * {@link AutorouteEngine#autoroute_connection(Set, Set, AutorouteControl, SortedSet, Map, SearchTreeManager)}):
+   * if another worker already ripped up an item this attempt depended on, the attempt is
+   * abandoned as a conflict and the item is left for a later pass, exactly like any other
+   * routing failure.
+   *
+   * <p>Because each worker's private tree is a point-in-time snapshot taken once at the start of
+   * the pass, it grows increasingly stale relative to the real board as the pass progresses --
+   * later items routed by a given worker are more likely to hit a conflict (and be deferred) than
+   * they would be sequentially. This trades a somewhat higher same-pass failure/retry rate for
+   * avoiding the cost of rebuilding a worker's tree before every single item; the normal
+   * escalating-ripup-cost multi-pass loop absorbs the deferred items on the next pass, the same
+   * way it already absorbs any other routing failure today.
+   */
+  private boolean autoroute_pass_parallel(int p_pass_no) {
+    long passStartTime = System.currentTimeMillis();
+    try {
+      List<Item> autoroute_item_list = getAutorouteItems(this.board);
+
+      if (autoroute_item_list.isEmpty()) {
+        this.air_line = null;
+        return false;
+      }
+
+      List<ItemNetWorkUnit> work_units = new ArrayList<>();
+      for (Item curr_item : autoroute_item_list) {
+        for (int i = 0; i < curr_item.net_count(); i++) {
+          work_units.add(new ItemNetWorkUnit(curr_item, curr_item.get_net_no(i)));
+        }
+      }
+
+      BoardStatistics stats = board.get_statistics();
+      RouterCounters routerCounters = new RouterCounters();
+      routerCounters.phase = "autoroute";
+      routerCounters.passCount = p_pass_no;
+      routerCounters.queuedToBeRoutedCount = work_units.size();
+      DesignRulesChecker tempDrc = new DesignRulesChecker(board, null);
+      tempDrc.calculateAllIncompletes();
+      routerCounters.incompleteCount = tempDrc.getIncompleteCount();
+      this.fireBoardUpdatedEvent(stats, routerCounters, this.board);
+
+      int threadCount = Math.max(1,
+          Math.min(this.settings.maxThreads, Runtime.getRuntime().availableProcessors()));
+      // Daemon threads: a worker stuck in a pathologically long maze search (bounded by the
+      // same per-connection time_limit the sequential path already uses) must never keep the
+      // whole JVM alive on its own.
+      ExecutorService pool = Executors.newFixedThreadPool(threadCount, r -> {
+        Thread t = new Thread(r, "parallel-autoroute-worker");
+        t.setDaemon(true);
+        return t;
+      });
+
+      AtomicInteger routed = new AtomicInteger();
+      AtomicInteger notRouted = new AtomicInteger();
+      AtomicInteger skipped = new AtomicInteger();
+      AtomicInteger rippedItemCount = new AtomicInteger();
+      // Mirrors the sequential pass's per-unit "this.totalItemsRouted++" (counts every attempt,
+      // not just successes) so the maxItems debug ceiling means the same thing in both paths.
+      AtomicInteger attempted = new AtomicInteger();
+
+      // One private scratch tree per worker THREAD, lazily built and cached the first time that
+      // thread encounters a given clearance class, then reused for the rest of this pass -- not
+      // rebuilt per item. See the class javadoc above for the staleness trade-off this implies.
+      ThreadLocal<Map<Integer, ShapeSearchTree>> workerScratchTrees = ThreadLocal.withInitial(HashMap::new);
+
+      // Bulk-synchronous batches: every worker searches, then a barrier, then this thread alone
+      // commits. Nothing mutates the board while searches are in flight, which is what makes
+      // the searches safe -- they read live Item geometry (trace shape counts, contacts) well
+      // beyond the search tree, so a concurrent commit would otherwise tear that state out from
+      // under them. Batching (rather than one barrier per pass) keeps each plan's view of the
+      // board at most one batch stale, which keeps the conflict rate low.
+      // One batch per worker: a sweep over 1x/2x/4x/8x the thread count showed no measurable
+      // difference in wall time, so the smallest is used -- it keeps each plan's view of the
+      // board the least stale, which is what the commit-time re-validation has to cope with.
+      int batchSize = threadCount;
+      for (int batch_start = 0; batch_start < work_units.size(); batch_start += batchSize) {
+        if (this.thread.is_stop_auto_router_requested()) {
+          break;
+        }
+        if (this.settings.maxItems != null && this.settings.maxItems > 0
+            && (this.totalItemsRouted + attempted.get()) >= this.settings.maxItems) {
+          this.thread.requestStop();
+          break;
+        }
+        int batch_end = Math.min(batch_start + batchSize, work_units.size());
+        List<ItemNetWorkUnit> batch = work_units.subList(batch_start, batch_end);
+
+        // ---- phase 1: parallel search, read-only with respect to the board ----
+        List<Callable<SearchAttempt>> tasks = new ArrayList<>(batch.size());
+        for (ItemNetWorkUnit unit : batch) {
+          tasks.add(() -> {
+            attempted.incrementAndGet();
+            SortedSet<Item> ripped_item_list = new TreeSet<>();
+            SearchOutcome outcome = autoroute_item_parallel(unit.item(), unit.net_no(),
+                ripped_item_list, p_pass_no, workerScratchTrees.get());
+            return new SearchAttempt(unit, outcome, ripped_item_list);
+          });
+        }
+        List<Future<SearchAttempt>> futures = pool.invokeAll(tasks);
+
+        // ---- phase 2: serial commit on this thread only ----
+        // A plan was searched against the board as it stood at the start of this batch, so each
+        // one is re-validated against the live board immediately before it is written. Plans
+        // that lost their space simply fail this pass and are retried on the next, exactly like
+        // any other routing failure.
+        for (Future<SearchAttempt> future : futures) {
+          // Surface worker exceptions instead of silently swallowing them.
+          SearchAttempt attempt = future.get();
+          AutorouteAttemptResult result = commit_search_attempt(attempt);
+          rippedItemCount.addAndGet(attempt.ripped_item_list().size());
+
+          if (result.state == AutorouteAttemptState.ROUTED) {
+            routed.incrementAndGet();
+          } else if (result.state == AutorouteAttemptState.ALREADY_CONNECTED
+              || result.state == AutorouteAttemptState.NO_UNCONNECTED_NETS
+              || result.state == AutorouteAttemptState.CONNECTED_TO_PLANE) {
+            skipped.incrementAndGet();
+          } else {
+            board.failureLog.recordFailure(attempt.unit().item(), p_pass_no, result.state, result.details);
+            notRouted.incrementAndGet();
+          }
+        }
+      }
+      pool.shutdown();
+
+      this.totalItemsRouted += attempted.get();
+
+      int incompletesBefore = calculateIncompleteCount(board);
+      FRLogger.trace(
+          "BatchAutorouter.autoroute_pass_parallel",
+          "compare_trace_remove_tails",
+          "Incompletes before remove_tails=" + incompletesBefore,
+          "Autorouter pass #" + p_pass_no,
+          new Point[0]);
+
+      if (this.remove_unconnected_vias) {
+        remove_tails(Item.StopConnectionOption.NONE);
+      } else {
+        remove_tails(Item.StopConnectionOption.FANOUT_VIA);
+      }
+
+      BoardStatistics finalStats = board.get_statistics();
+      routerCounters.passCount = p_pass_no;
+      routerCounters.queuedToBeRoutedCount = 0;
+      routerCounters.skippedCount = skipped.get();
+      routerCounters.rippedCount = rippedItemCount.get();
+      routerCounters.failedToBeRoutedCount = notRouted.get();
+      routerCounters.routedCount = routed.get();
+      routerCounters.incompleteCount = calculateIncompleteCount(board);
+      this.fireBoardUpdatedEvent(finalStats, routerCounters, this.board);
+
+      long passDuration = System.currentTimeMillis() - passStartTime;
+      int currentRipupCost = this.start_ripup_costs * p_pass_no;
+      PerformanceProfiler.recordPass(p_pass_no, routerCounters.incompleteCount, passDuration, currentRipupCost);
+
+      this.air_line = null;
+      return routed.get() > 0 || notRouted.get() > 0;
+    } catch (Exception e) {
+      job.logError("Something went wrong during the parallel auto-routing", e);
+      this.air_line = null;
+      return false;
+    }
+  }
+
+  /**
+   * Parallel-safe counterpart of {@link #autoroute_item}: routes a single (item, net) work unit
+   * against a private, worker-owned search tree, committing under {@link SearchTreeManager}'s
+   * write lock. Deliberately narrower than {@link #autoroute_item} -- see
+   * {@link #autoroute_pass_parallel}'s javadoc for what is intentionally left out.
+   */
+  private SearchOutcome autoroute_item_parallel(Item p_item, int p_route_net_no,
+      SortedSet<Item> p_ripped_item_list, int p_ripup_pass_no, Map<Integer, ShapeSearchTree> p_worker_scratch_trees) {
+    try {
+      boolean contains_plane = false;
+      Net route_net = board.rules.nets.get(p_route_net_no);
+      if (route_net != null) {
+        contains_plane = route_net.contains_plane();
+      }
+
+      int curr_via_costs = contains_plane ? this.settings.get_plane_via_costs() : this.settings.get_via_costs();
+
+      AutorouteControl autoroute_control = new AutorouteControl(this.board, p_route_net_no, settings, curr_via_costs,
+          this.trace_cost_arr);
+      autoroute_control.ripup_allowed = true;
+      autoroute_control.ripup_costs = this.start_ripup_costs * p_ripup_pass_no;
+      autoroute_control.remove_unconnected_vias = this.remove_unconnected_vias;
+
+      // Both connectivity queries walk item contacts through the board's REAL shared search
+      // tree (Item.get_normal_contacts -> BasicBoard.overlapping_objects -> get_default_tree),
+      // NOT through this worker's private scratch tree. They must therefore hold the read lock:
+      // without it they can traverse MinAreaTree while another worker's commit is mid-way
+      // through structurally relinking nodes under the write lock. Taken once around both calls
+      // rather than per call, since they are two halves of one consistent connectivity snapshot.
+      Set<Item> unconnected_set;
+      Set<Item> connected_set;
+      long connectivity_stamp = board.search_tree_manager.acquireReadLock();
+      try {
+        unconnected_set = p_item.get_unconnected_set(p_route_net_no);
+        connected_set = p_item.get_connected_set(p_route_net_no);
+      } finally {
+        board.search_tree_manager.releaseReadLock(connectivity_stamp);
+      }
+
+      if (unconnected_set.isEmpty()) {
+        return SearchOutcome.failed(AutorouteAttemptState.NO_UNCONNECTED_NETS);
+      }
+
+      if (contains_plane) {
+        for (Item curr_item : connected_set) {
+          if (curr_item instanceof ConductionArea) {
+            return SearchOutcome.failed(AutorouteAttemptState.CONNECTED_TO_PLANE);
+          }
+        }
+      }
+      Set<Item> route_start_set = contains_plane ? connected_set : unconnected_set;
+      Set<Item> route_dest_set = contains_plane ? unconnected_set : connected_set;
+
+      double max_milliseconds = 100000 * Math.pow(2, p_ripup_pass_no - 1);
+      max_milliseconds = Math.min(max_milliseconds, Integer.MAX_VALUE);
+      TimeLimit time_limit = new TimeLimit((int) max_milliseconds);
+
+      ShapeSearchTree scratch_tree = p_worker_scratch_trees.computeIfAbsent(
+          autoroute_control.trace_clearance_class_no,
+          board.search_tree_manager::build_scratch_search_tree);
+      AutorouteEngine autoroute_engine = new AutorouteEngine(this.board, scratch_tree, false);
+      autoroute_engine.init_connection(p_route_net_no, this.thread, time_limit);
+
+      // Search only -- no board mutation. The caller commits on a single thread once every
+      // worker in this batch has finished searching.
+      AutorouteEngine.ConnectionPlan plan = autoroute_engine.search_connection(route_start_set,
+          route_dest_set, autoroute_control, p_ripped_item_list, null);
+      return new SearchOutcome(plan, autoroute_control, autoroute_engine);
+    } catch (Exception e) {
+      FRLogger.error("Error during parallel routing search", e);
+      return new SearchOutcome(null, null, null);
+    }
+  }
+
+  /**
+   * What one worker produced for one work unit during the parallel search phase.
+   */
+  private record SearchOutcome(AutorouteEngine.ConnectionPlan plan, AutorouteControl ctrl,
+      AutorouteEngine engine) {
+
+    static SearchOutcome failed(AutorouteAttemptState p_state) {
+      return new SearchOutcome(AutorouteEngine.ConnectionPlan.failed(new AutorouteAttemptResult(p_state)),
+          null, null);
+    }
+  }
+
+  /**
+   * One work unit paired with the plan the search phase produced for it.
+   */
+  private record SearchAttempt(ItemNetWorkUnit unit, SearchOutcome outcome,
+      SortedSet<Item> ripped_item_list) {
+  }
+
+
+
+
+
+
+  /**
+   * Commits one searched plan, if it is still valid against the board as it now stands.
+   *
+   * <p>Runs on a single thread with no worker searching, so it needs no locking. Two staleness
+   * checks stand between a plan and the board: its rip-up victims must still exist, and the
+   * space its route wants must still be free. The second is delegated to
+   * {@code commit_connection}, which tests the located geometry against the live board -- a
+   * direct legality check rather than a guess about which regions earlier commits disturbed.
+   */
+  private AutorouteAttemptResult commit_search_attempt(SearchAttempt p_attempt) {
+    SearchOutcome outcome = p_attempt.outcome();
+    if (outcome.plan() == null) {
+      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED, "The search phase failed.");
+    }
+    if (outcome.plan().failure != null) {
+      return outcome.plan().failure;
+    }
+
+    if (!AutorouteEngine.ripped_items_still_present(p_attempt.ripped_item_list())) {
+      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
+          "CONCURRENT_CONFLICT: an item planned for rip-up was already removed by an earlier "
+              + "commit in this batch.");
+    }
+
+    AutorouteAttemptResult result = outcome.engine()
+        .commit_connection(outcome.plan(), outcome.ctrl(), p_attempt.ripped_item_list(), true);
+
+    if (result.state == AutorouteAttemptState.ROUTED) {
+      board.start_marking_changed_area();
+      board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, outcome.ctrl().trace_costs,
+          this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+    }
+    return result;
   }
 
   @Override
