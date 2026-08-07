@@ -28,7 +28,7 @@ public class MinAreaTree extends ShapeTree {
     if (this.root == null) {
       return found_overlaps;
     }
-    ArrayStack<TreeNode> node_stack = new ArrayStack<>(10000);
+    ArrayStack<TreeNode> node_stack = new ArrayStack<>(QUERY_STACK_INITIAL_CAPACITY);
     node_stack.push(this.root);
     TreeNode curr_node;
     for (; ; ) {

@@ -62,7 +62,7 @@ public class ShapeSearchTree90Degree extends ShapeSearchTree {
     // Process obstacles inline during tree traversal with dynamic bounding_shape updates.
     // This matches v1.9's algorithm exactly: as obstacles are processed, bounding_shape
     // shrinks, which prunes subsequent tree traversal (just like v1.9 does).
-    ArrayStack<TreeNode> node_stack = new ArrayStack<>(10000);
+    ArrayStack<TreeNode> node_stack = new ArrayStack<>(QUERY_STACK_INITIAL_CAPACITY);
     node_stack.push(this.root);
     TreeNode curr_node;
 
@@ -113,7 +113,10 @@ public class ShapeSearchTree90Degree extends ShapeSearchTree {
                     curr_object_shape);
                 new_result.addAll(new_restrained_shapes);
 
-                for (IncompleteFreeSpaceExpansionRoom tmp_shape : new_result) {
+                // Only the newly added shapes need folding in -- see the identical note in
+                // ShapeSearchTree45Degree.complete_shape. Re-folding all of new_result was
+                // idempotent work that made this loop quadratic in the room count.
+                for (IncompleteFreeSpaceExpansionRoom tmp_shape : new_restrained_shapes) {
                   new_bounding_shape = new_bounding_shape.union(tmp_shape.get_shape().bounding_box());
                 }
               } else {

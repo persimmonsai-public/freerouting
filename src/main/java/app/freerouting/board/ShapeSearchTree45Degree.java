@@ -121,7 +121,7 @@ public class ShapeSearchTree45Degree extends ShapeSearchTree {
     int debugStep = 0;
     Collection<IncompleteFreeSpaceExpansionRoom> result = new LinkedList<>();
     result.add(new IncompleteFreeSpaceExpansionRoom(start_shape, room_layer, shape_to_be_contained));
-    ArrayStack<TreeNode> node_stack = new ArrayStack<>(10000);
+    ArrayStack<TreeNode> node_stack = new ArrayStack<>(QUERY_STACK_INITIAL_CAPACITY);
     node_stack.push(this.root);
     TreeNode curr_node;
 
@@ -178,7 +178,12 @@ public class ShapeSearchTree45Degree extends ShapeSearchTree {
                 Collection<IncompleteFreeSpaceExpansionRoom> new_restrained_shapes = restrain_shape(curr_room, curr_object_shape);
                 new_result.addAll(new_restrained_shapes);
 
-                for (IncompleteFreeSpaceExpansionRoom tmp_shape : new_result) {
+                // Fold in only the shapes just added, not all of new_result. Every path that
+                // adds to new_result also unions that shape into new_bounding_shape, so the
+                // accumulator already covers each earlier entry -- and union is idempotent, so
+                // re-folding them yielded an identical value at O(rooms) cost per obstacle,
+                // making this loop quadratic in the room count for no effect.
+                for (IncompleteFreeSpaceExpansionRoom tmp_shape : new_restrained_shapes) {
                   new_bounding_shape = new_bounding_shape.union(tmp_shape
                       .get_shape()
                       .bounding_box());

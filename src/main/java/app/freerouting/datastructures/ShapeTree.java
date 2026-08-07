@@ -12,6 +12,20 @@ import app.freerouting.logger.FRLogger;
 public abstract class ShapeTree {
 
   /**
+   * Initial capacity of the scratch stack a tree query uses to walk nodes depth-first.
+   *
+   * <p>The stack never holds more than roughly twice the tree's depth at once, so a small
+   * buffer suffices; {@link ArrayStack} grows itself if an unusually deep tree needs more.
+   *
+   * <p>This was 10000, which made every single query allocate and zero-fill a 40 KB
+   * {@code Object[]} before visiting its typical ~100 nodes. CPU profiling of a 130-second
+   * routing run put {@code MinAreaTree.overlaps} at <b>50.8% of total router self time</b> --
+   * that cost was the allocation, not the traversal. Queries are the router's innermost
+   * operation, so this constant is disproportionately load-bearing.
+   */
+  protected static final int QUERY_STACK_INITIAL_CAPACITY = 64;
+
+  /**
    * the fixed directions for calculating bounding RegularTileShapes of shapes to store in this tree.
    */
   protected final ShapeBoundingDirections bounding_directions;
