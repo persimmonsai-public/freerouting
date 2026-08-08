@@ -276,6 +276,16 @@ public final class PartitionRouter {
   private record ItemContact(Item item, int tree_entry_no) {
   }
 
+  private static int contact_rank(Item p_item) {
+    if (p_item instanceof app.freerouting.board.Via) {
+      return 3;
+    }
+    if (p_item instanceof Pin) {
+      return 2;
+    }
+    return 1;
+  }
+
   /**
    * Rooms that touch (within p_touch_margin) a shape of any of the items on the layer, mapped
    * to that item and shape index.
@@ -311,8 +321,14 @@ public final class PartitionRouter {
               continue;
             }
           }
+          // Attachment preference, by boundedness of the connection shape Locate will aim at:
+          // vias and pins connect at a POINT (bounded), while a trace's connection shape is a
+          // simplex of half-planes that is UNBOUNDED in some directions -- measured to make
+          // Locate's final corner land on the 2^25 sentinel coordinate when the channel
+          // approaches from an unbounded side (the dominant reject after windowed channels).
+          // Pad exits are safe to prefer again because the escape-axis aim handles them.
           ItemContact previous = result.get(room);
-          if (previous == null || (previous.item() instanceof Pin && !(item instanceof Pin))) {
+          if (previous == null || contact_rank(item) > contact_rank(previous.item())) {
             result.put(room, new ItemContact(item, i));
           }
         }
@@ -385,6 +401,21 @@ public final class PartitionRouter {
     double aim_from_y = (joints[0].ll.y + joints[0].ur.y) / 2.0;
     double aim_to_x = (joints[path.size()].ll.x + joints[path.size()].ur.x) / 2.0;
     double aim_to_y = (joints[path.size()].ll.y + joints[path.size()].ur.y) / 2.0;
+    // Array-pad escape: when a terminal is a detected array pad (BGA/ring/peripheral), the
+    // only legal exit at fine pitch runs along the pad's escape axis -- a generic aim line
+    // can point sideways into the neighbouring pad's clearance (measured as the dominant
+    // residual reject). Move that terminal's aim origin to the escape point just beyond the
+    // pad end, so the interpolated windows lead the channel out along the axis first.
+    double[] start_escape = escape_aim(p_route.start_item, aim_to_x, aim_to_y, channel_margin);
+    if (start_escape != null) {
+      aim_from_x = start_escape[0];
+      aim_from_y = start_escape[1];
+    }
+    double[] target_escape = escape_aim(p_route.target_item, aim_from_x, aim_from_y, channel_margin);
+    if (target_escape != null) {
+      aim_to_x = target_escape[0];
+      aim_to_y = target_escape[1];
+    }
     for (int i = 1; i < path.size(); i++) {
       double t = i / (double) path.size();
       int window_x = (int) Math.round(aim_from_x + t * (aim_to_x - aim_from_x));
@@ -473,6 +504,37 @@ public final class PartitionRouter {
     // The start door's element keeps its default null backtrack_door, terminating the walk.
     return new MazeSearchAlgo.Result(target_door, 0);
   }
+
+  /**
+   * The escape-axis aim point for a terminal item, or null when the item is not a detected
+   * array pad. The point sits one channel-margin beyond the pad end along the escape axis;
+   * for unsigned axes (ring/peripheral long-axis pads) the end nearer the other terminal is
+   * chosen.
+   */
+  private double[] escape_aim(Item p_item, double p_toward_x, double p_toward_y, int p_margin) {
+    if (!(p_item instanceof Pin pin)) {
+      return null;
+    }
+    if (pad_array_detector == null) {
+      pad_array_detector = new PadArrayDetector(board);
+    }
+    PadArrayDetector.PadEscape escape = pad_array_detector.escape_of(pin);
+    if (escape == null || (escape.axis_x() == 0 && escape.axis_y() == 0)) {
+      return null;
+    }
+    app.freerouting.geometry.planar.FloatPoint center = pin.get_center().to_float();
+    int sign = 1;
+    if (!escape.signed()) {
+      double dot = escape.axis_x() * (p_toward_x - center.x) + escape.axis_y() * (p_toward_y - center.y);
+      sign = dot >= 0 ? 1 : -1;
+    }
+    double reach = escape.half_extent() + p_margin;
+    return new double[]{
+        center.x + sign * escape.axis_x() * reach,
+        center.y + sign * escape.axis_y() * reach};
+  }
+
+  private PadArrayDetector pad_array_detector;
 
   private static double heuristic(FreeSpacePartition.Room p_room, Set<FreeSpacePartition.Room> p_targets) {
     double best = Double.MAX_VALUE;
