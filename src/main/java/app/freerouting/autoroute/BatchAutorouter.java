@@ -443,6 +443,65 @@ public class BatchAutorouter extends NamedAlgorithm {
    * Auto-routes one ripup pass of all items of the board. Returns false, if the
    * board is already completely routed.
    */
+  private long partition_routed_count;
+  private long partition_fallback_count;
+
+  /**
+   * Attempts the connection over the free-space partition. Returns a ROUTED result on success,
+   * or null when the classic engine should handle the connection instead (no route found in the
+   * partition, unsupported case, degenerate door chain, or the plan lost the commit-time
+   * geometry re-validation because the partition was stale).
+   */
+  private AutorouteAttemptResult try_partition_route(Set<Item> p_start_set, Set<Item> p_dest_set,
+      AutorouteControl p_ctrl) {
+    try {
+      ShapeSearchTree tree = board.search_tree_manager.get_autoroute_tree(p_ctrl.trace_clearance_class_no);
+      if (partition_router == null) {
+        partition_router = new PartitionRouter(board, tree);
+      }
+      PartitionRouter.CellRoute route = partition_router.try_route(p_start_set, p_dest_set,
+          p_ctrl.compensated_trace_half_width);
+      if (route == null) {
+        ++partition_fallback_count;
+        return null;
+      }
+      MazeSearchAlgo.Result seed = partition_router.materialize(route, p_ctrl);
+      if (seed == null) {
+        ++partition_fallback_count;
+        return null;
+      }
+      SortedSet<Item> no_ripped = new TreeSet<>();
+      LocateFoundConnectionAlgo located = LocateFoundConnectionAlgo.get_instance(seed, p_ctrl, tree,
+          board.rules.get_trace_angle_restriction(), no_ripped, null);
+      if (located == null || located.connection_items == null || located.connection_items.isEmpty()) {
+        ++partition_fallback_count;
+        return null;
+      }
+      AutorouteEngine commit_engine = new AutorouteEngine(board, tree, false);
+      AutorouteEngine.ConnectionPlan plan = AutorouteEngine.ConnectionPlan.found(located, null);
+      // validate=true re-checks the located geometry against the LIVE tree, which is what makes
+      // partition staleness safe: a stale route simply fails here and the classic engine runs.
+      AutorouteAttemptResult result = commit_engine.commit_connection(plan, p_ctrl, no_ripped, true);
+      if (result.state != AutorouteAttemptState.ROUTED) {
+        partition_router.invalidate();
+        ++partition_fallback_count;
+        return null;
+      }
+      ++partition_routed_count;
+      partition_router.invalidate();
+      board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, p_ctrl.trace_costs,
+          this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+      return result;
+    } catch (Exception e) {
+      FRLogger.error("PartitionRouter attempt failed; falling back to the classic engine", e);
+      if (partition_router != null) {
+        partition_router.invalidate();
+      }
+      ++partition_fallback_count;
+      return null;
+    }
+  }
+
   /**
    * Whether this pass should route items in parallel across multiple worker threads instead of
    * one at a time. Gated behind the existing {@code featureFlags.multiThreading} toggle (already
@@ -456,6 +515,17 @@ public class BatchAutorouter extends NamedAlgorithm {
    * bit-for-bit reproducible run-to-run -- see {@code autoroute_pass_parallel}'s javadoc).
    */
 
+
+  /**
+   * Partition-based single-layer router (docs/free-space-partition.md stage 2), created on
+   * first use when the feature flag is on. Null otherwise.
+   */
+  private PartitionRouter partition_router;
+
+  private boolean isPartitionRouterEnabled() {
+    return app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.partitionRouter;
+  }
 
   private boolean isParallelAutoroutingEnabled() {
     return app.freerouting.Freerouting.globalSettings != null
@@ -744,6 +814,13 @@ public class BatchAutorouter extends NamedAlgorithm {
       int currentRipupCost = this.start_ripup_costs * p_pass_no;
       PerformanceProfiler.recordPass(p_pass_no, routerCounters.incompleteCount, passDuration, currentRipupCost);
 
+
+      if (isPartitionRouterEnabled()) {
+        job.logInfo("[partition-router] pass=" + p_pass_no + " routed=" + partition_routed_count
+            + " fallback=" + partition_fallback_count);
+        partition_routed_count = 0;
+        partition_fallback_count = 0;
+      }
 
       // We are done with this pass
       this.air_line = null;
@@ -1686,6 +1763,17 @@ public class BatchAutorouter extends NamedAlgorithm {
       double max_milliseconds = 100000 * Math.pow(2, p_ripup_pass_no - 1);
       max_milliseconds = Math.min(max_milliseconds, Integer.MAX_VALUE);
       TimeLimit time_limit = new TimeLimit((int) max_milliseconds);
+
+      // Stage-2 partition router: try the cheap canonical-partition search first; any
+      // failure, unsupported case, or commit-time conflict falls through to the classic
+      // engine below, so the worst case is the status quo plus a fast failed attempt.
+      if (isPartitionRouterEnabled() && !contains_plane) {
+        AutorouteAttemptResult partition_result = try_partition_route(route_start_set, route_dest_set,
+            autoroute_control);
+        if (partition_result != null) {
+          return partition_result;
+        }
+      }
 
       // Initialize the auto-router engine
       AutorouteEngine autoroute_engine = board.init_autoroute(p_route_net_no,

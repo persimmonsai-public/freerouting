@@ -1,7 +1,7 @@
 # Maintained free-space partition — design and measurements
 
-Status: **stage 1 of 3 landed** (data structure + feasibility gate). The router does not use
-it yet.
+Status: **stage 2 landed behind a default-off flag** (`featureFlags.partitionRouter`); not yet
+a performance win -- see the stage-2 results below for exactly why and what remains.
 
 ## Why
 
@@ -75,8 +75,28 @@ lazy construction, behind a flag:
 - drills: `DrillPageArray` machinery is unchanged (it queries the item tree, which still holds
   the items), but pages must persist across connections and invalidate locally.
 
-**Stage 3 — measure and gate.** Same protocol as everything else in this effort: three
-isolated runs, `--no-build-cache`, score-parity gate (≥ 989.72, ≤ 2 unrouted, 0 violations)
-before any wall-clock claim. The upside case from the profile is ~1.7–1.9x sequential; the
-history of this optimization effort (nine estimates, eight dead on measurement) is the reason
-the gates come first.
+**Stage 2 status (measured).** The full pipeline works end-to-end -- partition A*, hand-built
+backtrack chain, unchanged Locate/Insert, validated commit -- and it committed real routes with
+the score gate intact (one run even ended *better* than baseline: 994.85 / 1 unrouted). Two
+contract discoveries shaped the implementation: `DrillItem.get_trace_connection_shape` is a
+single point (the pad centre), so the destination cell must overlap the item's interior --
+solved by lifting the routing net's items out of the partition per search (bulk API, edge
+refcounting); and door sections must be allocated with exactly the offset Locate re-derives.
+
+It is not yet a win, for two measured reasons:
+
+1. **Hit rate ~1%** (2–12 of ~200 attempts per pass). The dominant residual failure is
+   commit-time validation rejecting pad exits that clip a NEIGHBOURING pad's clearance --
+   fine-pitch exits are legal only under the pad-exit/acid-trap exemptions implemented inside
+   the classic insert path (`check_trace_shape` contact-pin handling), which the plain
+   clearance validator does not model. Aiming door sections along the endpoint line did not
+   change this (144 -> 140 failures).
+2. **Attempt overhead**: lifting a partly-routed net spans most of the board, so each attempt
+   pays a near-full-board rebuild even with bulk mutation (run: 43 s -> 75 s with the flag on).
+
+**Stage 3 — what would make it a win, in order:** model the pad-exit exemptions in the
+commit-time validator (or delegate terminal-segment legality to `check_trace_shape` with
+contact pins); replace the whole-net lift with a net-aware overlay so attempts stop paying
+board-scale rebuilds; then vias (`ExpansionDrill` chain elements). Gate protocol unchanged:
+three isolated runs, `--no-build-cache`, score ≥ 989.72, ≤ 2 unrouted, 0 violations, and
+wall-clock only after the gate.

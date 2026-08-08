@@ -58,6 +58,11 @@ public final class FreeSpacePartition {
   public static final class Cell {
 
     public final IntBox box;
+    /**
+     * Position of this cell in {@link #cells()}, stable until the next mutation. Search code
+     * uses it to index parallel arrays; it must not be persisted across partition updates.
+     */
+    public int index;
 
     Cell(IntBox p_box) {
       this.box = p_box;
@@ -75,6 +80,12 @@ public final class FreeSpacePartition {
    */
   private final TreeSet<Integer> slab_edges = new TreeSet<>();
   /**
+   * How many live obstacle shapes contribute each slab edge. Without this, edges from removed
+   * obstacles accumulated forever, and repeated remove/insert cycles (the per-search net lift)
+   * made every subsequent rebuild progressively slower.
+   */
+  private final Map<Integer, Integer> edge_refcount = new HashMap<>();
+  /**
    * Free y-intervals per slab, keyed by the slab's left edge. Each interval is {low, high}.
    * Rebuilt (for affected slabs only) on every mutation.
    */
@@ -82,6 +93,42 @@ public final class FreeSpacePartition {
 
   private List<Cell> cells;
   private Map<Cell, List<Cell>> adjacency;
+  /**
+   * While a bulk mutation is open, {@link #insert}/{@link #remove} only accumulate the dirty
+   * x-range; {@link #end_bulk} performs one slab rebuild over the union. Lifting a routed
+   * net's items one at a time triggered a near-full rebuild per long trace, twice per search.
+   */
+  private boolean bulk_open;
+  private int bulk_from_x;
+  private int bulk_to_x;
+
+  /**
+   * Starts accumulating mutations without rebuilding; must be paired with {@link #end_bulk}.
+   */
+  public void begin_bulk() {
+    bulk_open = true;
+    bulk_from_x = bounds.ur.x;
+    bulk_to_x = bounds.ll.x;
+  }
+
+  /**
+   * Applies the accumulated dirty range in a single rebuild.
+   */
+  public void end_bulk() {
+    bulk_open = false;
+    if (bulk_from_x < bulk_to_x) {
+      rebuild_slab_range(clamp_x(bulk_from_x), clamp_x(bulk_to_x));
+    }
+  }
+
+  private void mark_or_rebuild(int p_from_x, int p_to_x) {
+    if (bulk_open) {
+      bulk_from_x = Math.min(bulk_from_x, p_from_x);
+      bulk_to_x = Math.max(bulk_to_x, p_to_x);
+    } else {
+      rebuild_slab_range(clamp_x(p_from_x), clamp_x(p_to_x));
+    }
+  }
 
   public FreeSpacePartition(IntBox p_bounds) {
     this.bounds = p_bounds;
@@ -102,6 +149,8 @@ public final class FreeSpacePartition {
         IntBox b = shape.bounding_box();
         from_x = Math.min(from_x, b.ll.x);
         to_x = Math.max(to_x, b.ur.x);
+        release_edge(clamp_x(b.ll.x));
+        release_edge(clamp_x(b.ur.x));
       }
     }
     List<TileShape> kept = new ArrayList<>();
@@ -115,8 +164,8 @@ public final class FreeSpacePartition {
         continue;
       }
       kept.add(shape);
-      slab_edges.add(clamp_x(b.ll.x));
-      slab_edges.add(clamp_x(b.ur.x));
+      add_edge(clamp_x(b.ll.x));
+      add_edge(clamp_x(b.ur.x));
       from_x = Math.min(from_x, b.ll.x);
       to_x = Math.max(to_x, b.ur.x);
     }
@@ -124,7 +173,7 @@ public final class FreeSpacePartition {
       obstacles.put(p_obstacle_id, kept);
     }
     if (from_x < to_x) {
-      rebuild_slab_range(clamp_x(from_x), clamp_x(to_x));
+      mark_or_rebuild(from_x, to_x);
     }
   }
 
@@ -142,12 +191,32 @@ public final class FreeSpacePartition {
       IntBox b = shape.bounding_box();
       from_x = Math.min(from_x, b.ll.x);
       to_x = Math.max(to_x, b.ur.x);
+      release_edge(clamp_x(b.ll.x));
+      release_edge(clamp_x(b.ur.x));
     }
-    // Slab edges contributed by the removed shapes are retained: superfluous edges only split
-    // cells that the horizontal merge immediately rejoins, so correctness is unaffected, and
-    // dropping an edge would require proving no other obstacle shares it.
     if (from_x < to_x) {
-      rebuild_slab_range(clamp_x(from_x), clamp_x(to_x));
+      mark_or_rebuild(from_x, to_x);
+    }
+  }
+
+  private void add_edge(int p_x) {
+    edge_refcount.merge(p_x, 1, Integer::sum);
+    slab_edges.add(p_x);
+  }
+
+  private void release_edge(int p_x) {
+    Integer count = edge_refcount.get(p_x);
+    if (count == null) {
+      return;
+    }
+    if (count <= 1) {
+      edge_refcount.remove(p_x);
+      if (p_x != bounds.ll.x && p_x != bounds.ur.x) {
+        slab_edges.remove(p_x);
+        free_intervals.remove(p_x);
+      }
+    } else {
+      edge_refcount.put(p_x, count - 1);
     }
   }
 
@@ -160,6 +229,20 @@ public final class FreeSpacePartition {
       build_cells();
     }
     return cells;
+  }
+
+  /**
+   * The cells whose rectangles intersect p_region (touching edges do not count).
+   */
+  public List<Cell> cells_intersecting(IntBox p_region) {
+    List<Cell> result = new ArrayList<>();
+    for (Cell c : cells()) {
+      if (c.box.ll.x < p_region.ur.x && p_region.ll.x < c.box.ur.x
+          && c.box.ll.y < p_region.ur.y && p_region.ll.y < c.box.ur.y) {
+        result.add(c);
+      }
+    }
+    return result;
   }
 
   /**
@@ -310,6 +393,7 @@ public final class FreeSpacePartition {
       Map<Integer, List<Cell>> p_ended_at, Map<Integer, List<Cell>> p_started_at) {
     for (int[] strip : p_open.values()) {
       Cell cell = new Cell(new IntBox(strip[0], strip[1], p_end_x, strip[2]));
+      cell.index = cells.size();
       cells.add(cell);
       p_ended_at.computeIfAbsent(p_end_x, k -> new ArrayList<>()).add(cell);
       p_started_at.computeIfAbsent(strip[0], k -> new ArrayList<>()).add(cell);

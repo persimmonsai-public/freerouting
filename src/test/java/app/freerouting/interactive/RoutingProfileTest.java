@@ -37,6 +37,7 @@ class RoutingProfileTest {
   void setUp() {
     Freerouting.globalSettings = new GlobalSettings();
     Freerouting.globalSettings.featureFlags.parallelAutorouter = true;
+    Freerouting.globalSettings.featureFlags.partitionRouter = Boolean.getBoolean("fr.partition");
     InteractiveSettings.resetForTesting();
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {

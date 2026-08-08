@@ -44,6 +44,15 @@ public class FeatureFlagsSettings implements Serializable {
    */
   @SerializedName("parallel_autorouter")
   public boolean parallelAutorouter = false;
+  /**
+   * Routes single-layer connections over the maintained free-space partition
+   * (docs/free-space-partition.md, stage 2) instead of the lazily built expansion-room
+   * decomposition, falling back to the classic engine whenever the partition route fails,
+   * needs a layer change, or fails the commit-time geometry re-validation. Off by default
+   * until it has passed the score-parity gate on more than one fixture.
+   */
+  @SerializedName("partition_router")
+  public boolean partitionRouter = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")
