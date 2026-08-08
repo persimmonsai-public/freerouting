@@ -136,8 +136,26 @@ class FreeSpacePartitionTest {
         assertEquals(canonical(fresh), canonical(partition),
             "bulk-maintained partition diverged from a from-scratch build (round " + round
                 + ", batch " + batch + ")");
+        assertEquals(canonicalRooms(fresh), canonicalRooms(partition),
+            "incrementally maintained ROOMS diverged from a from-scratch build (round " + round
+                + ", batch " + batch + ")");
+        // Adjacency symmetry must survive incremental splicing too.
+        for (FreeSpacePartition.Room room : partition.rooms()) {
+          for (FreeSpacePartition.Room n : partition.room_neighbors(room)) {
+            assertTrue(partition.room_neighbors(n).contains(room),
+                "incremental room adjacency not symmetric (round " + round + ", batch " + batch + ")");
+          }
+        }
       }
     }
+  }
+
+  private static Set<String> canonicalRooms(FreeSpacePartition p) {
+    Set<String> result = new HashSet<>();
+    for (FreeSpacePartition.Room r : p.rooms()) {
+      result.add(boxString(r.box));
+    }
+    return result;
   }
 
   /**

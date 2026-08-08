@@ -71,9 +71,11 @@ public final class PartitionRouter {
   }
 
   /**
-   * Marks the partitions stale; they are rebuilt wholesale on the next search. A full rebuild
-   * was measured at 21 ms for the reference board, so per-commit incremental maintenance is
-   * deliberately deferred until the wholesale cost shows up in a profile.
+   * Marks the partitions as possibly lagging the board; the next search re-synchronizes them
+   * by DIFF, not by wholesale rebuild: unchanged items are recognized by reference-identical
+   * tree-shape lists (the search tree caches shape objects per item until the item changes),
+   * and only the changed ids pay local slab updates -- which the partition then propagates to
+   * its cells and rooms locally as well.
    */
   public void invalidate() {
     this.dirty = true;
@@ -84,40 +86,67 @@ public final class PartitionRouter {
       return;
     }
     IntBox bounds = board.get_bounding_box();
+    // One scan of the board gathers every signal layer's id -> shapes map.
+    List<Map<Integer, List<TileShape>>> current = new ArrayList<>(partitions.length);
     for (int layer = 0; layer < partitions.length; layer++) {
-      if (!board.layer_structure.arr[layer].is_signal) {
+      current.add(board.layer_structure.arr[layer].is_signal ? new java.util.HashMap<>() : null);
+    }
+    for (Item item : board.get_items()) {
+      int shape_count = item.tree_shape_count(tree);
+      for (int i = 0; i < shape_count; i++) {
+        int layer = item.shape_layer(i);
+        if (layer < 0 || layer >= partitions.length) {
+          continue;
+        }
+        Map<Integer, List<TileShape>> layer_map = current.get(layer);
+        if (layer_map == null) {
+          continue;
+        }
+        TileShape shape = item.get_tree_shape(tree, i);
+        if (shape == null || shape.is_empty()) {
+          continue;
+        }
+        layer_map.computeIfAbsent(item.get_id_no(), k -> new ArrayList<>(2)).add(shape);
+      }
+    }
+    for (int layer = 0; layer < partitions.length; layer++) {
+      Map<Integer, List<TileShape>> target = current.get(layer);
+      if (target == null) {
         partitions[layer] = null;
         continue;
       }
-      FreeSpacePartition partition = new FreeSpacePartition(bounds);
-      // Bulk mode: without it every single insert pays an immediate local slab rebuild and a
-      // from-scratch build costs ~240 ms instead of the ~21 ms measured for one bulk rebuild
-      // (observed as +47 s over a pass once the partition was invalidated per attempt).
+      FreeSpacePartition partition = partitions[layer];
+      if (partition == null) {
+        partition = new FreeSpacePartition(bounds);
+        partitions[layer] = partition;
+      }
       partition.begin_bulk();
-      for (Item item : board.get_items()) {
-        int shape_count = item.tree_shape_count(tree);
-        List<TileShape> shapes = null;
-        for (int i = 0; i < shape_count; i++) {
-          if (item.shape_layer(i) != layer) {
-            continue;
-          }
-          TileShape shape = item.get_tree_shape(tree, i);
-          if (shape == null || shape.is_empty()) {
-            continue;
-          }
-          if (shapes == null) {
-            shapes = new ArrayList<>(2);
-          }
-          shapes.add(shape);
+      for (Integer id : new ArrayList<>(partition.obstacle_map().keySet())) {
+        if (!target.containsKey(id)) {
+          partition.remove(id);
         }
-        if (shapes != null) {
-          partition.insert(item.get_id_no(), shapes);
+      }
+      for (Map.Entry<Integer, List<TileShape>> entry : target.entrySet()) {
+        List<TileShape> stored = partition.obstacle_map().get(entry.getKey());
+        if (stored == null || !same_shape_list(stored, entry.getValue())) {
+          partition.insert(entry.getKey(), entry.getValue());
         }
       }
       partition.end_bulk();
-      partitions[layer] = partition;
     }
     dirty = false;
+  }
+
+  private static boolean same_shape_list(List<TileShape> p_a, List<TileShape> p_b) {
+    if (p_a.size() != p_b.size()) {
+      return false;
+    }
+    for (int i = 0; i < p_a.size(); i++) {
+      if (p_a.get(i) != p_b.get(i)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -173,9 +202,9 @@ public final class PartitionRouter {
       }
       return best;
     } finally {
-      // Every attempt is followed by invalidate() from the caller (staleness-vs-quality
-      // tradeoff measured in BatchAutorouter), so re-inserting the lifted net into
-      // partitions that are about to be rebuilt wholesale is pure waste; just mark dirty.
+      // The next attempt's diff synchronization re-inserts the lifted net (its items are on
+      // the board but missing from the partition's obstacle map), so an explicit restore here
+      // would do the same local work twice. Marking dirty is sufficient and cheaper.
       dirty = true;
     }
   }

@@ -103,6 +103,39 @@ public final class FreeSpacePartition {
    */
   private boolean bulk_open;
   private final TreeMap<Integer, Integer> bulk_ranges = new TreeMap<>();
+  /**
+   * Slab spans whose intervals changed since cells/rooms were last brought up to date.
+   * {@link #cells()} and {@link #rooms()} apply these by LOCAL splicing instead of whole-board
+   * rebuilds -- the design's "updates are local" property extended from the slab intervals to
+   * the derived structures (whole-board cell+room rebuilds per attempt were measured as the
+   * dominant flag-on cost: 19-26 s of a 38 s pass).
+   */
+  private final TreeMap<Integer, Integer> stale_cell_ranges = new TreeMap<>();
+  private final TreeMap<Integer, Integer> stale_room_ranges = new TreeMap<>();
+
+  /**
+   * Merges [p_from, p_to] into a disjoint range map, absorbing every overlapping entry.
+   */
+  private static void merge_range(TreeMap<Integer, Integer> p_ranges, int p_from, int p_to) {
+    int from = p_from;
+    int to = p_to;
+    Map.Entry<Integer, Integer> prev = p_ranges.floorEntry(to);
+    while (prev != null && prev.getValue() >= from) {
+      from = Math.min(from, prev.getKey());
+      to = Math.max(to, prev.getValue());
+      p_ranges.remove(prev.getKey());
+      prev = p_ranges.floorEntry(to);
+    }
+    p_ranges.put(from, to);
+  }
+
+  /**
+   * The live obstacle map (id -> stored shapes), for diff-based synchronization against an
+   * external source of truth. Callers must treat it as read-only.
+   */
+  Map<Integer, List<TileShape>> obstacle_map() {
+    return obstacles;
+  }
 
   /**
    * Starts accumulating mutations without rebuilding; must be paired with {@link #end_bulk}.
@@ -125,17 +158,7 @@ public final class FreeSpacePartition {
 
   private void mark_or_rebuild(int p_from_x, int p_to_x) {
     if (bulk_open) {
-      int from = p_from_x;
-      int to = p_to_x;
-      // absorb every stored range that overlaps [from, to]
-      Map.Entry<Integer, Integer> prev = bulk_ranges.floorEntry(to);
-      while (prev != null && prev.getValue() >= from) {
-        from = Math.min(from, prev.getKey());
-        to = Math.max(to, prev.getValue());
-        bulk_ranges.remove(prev.getKey());
-        prev = bulk_ranges.floorEntry(to);
-      }
-      bulk_ranges.put(from, to);
+      merge_range(bulk_ranges, p_from_x, p_to_x);
     } else {
       rebuild_slab_range(clamp_x(p_from_x), clamp_x(p_to_x));
     }
@@ -232,12 +255,23 @@ public final class FreeSpacePartition {
   }
 
   /**
-   * The current cells. The returned list is rebuilt on demand after mutations and must not be
-   * mutated by the caller.
+   * The current cells. Brought up to date on demand -- built once, then locally spliced over
+   * the accumulated stale slab spans. Must not be mutated by the caller.
    */
   public List<Cell> cells() {
     if (cells == null) {
       build_cells();
+      stale_cell_ranges.clear();
+      rooms = null;
+      room_adjacency = null;
+      room_keys = null;
+      stale_room_ranges.clear();
+    } else if (!stale_cell_ranges.isEmpty()) {
+      List<Map.Entry<Integer, Integer>> pending = new ArrayList<>(stale_cell_ranges.entrySet());
+      stale_cell_ranges.clear();
+      for (Map.Entry<Integer, Integer> range : pending) {
+        update_cells_range(range.getKey(), range.getValue());
+      }
     }
     return cells;
   }
@@ -260,11 +294,41 @@ public final class FreeSpacePartition {
    * The cells sharing a vertical border segment with p_cell.
    */
   public List<Cell> neighbors(Cell p_cell) {
+    cells();
     if (adjacency == null) {
-      build_cells();
+      build_cell_adjacency();
     }
     List<Cell> result = adjacency.get(p_cell);
     return result == null ? List.of() : result;
+  }
+
+  /**
+   * Cell adjacency from scratch over the current cell list: cells ending at an edge border
+   * cells starting at that edge where y-ranges overlap. Lazy because only diagnostics and
+   * tests read it; the router searches the room cover.
+   */
+  private void build_cell_adjacency() {
+    adjacency = new HashMap<>();
+    Map<Integer, List<Cell>> ended_at = new HashMap<>();
+    Map<Integer, List<Cell>> started_at = new HashMap<>();
+    for (Cell c : cells) {
+      ended_at.computeIfAbsent(c.box.ur.x, k -> new ArrayList<>()).add(c);
+      started_at.computeIfAbsent(c.box.ll.x, k -> new ArrayList<>()).add(c);
+    }
+    for (Map.Entry<Integer, List<Cell>> e : ended_at.entrySet()) {
+      List<Cell> starters = started_at.get(e.getKey());
+      if (starters == null) {
+        continue;
+      }
+      for (Cell a : e.getValue()) {
+        for (Cell b : starters) {
+          if (a.box.ll.y < b.box.ur.y && b.box.ll.y < a.box.ur.y) {
+            adjacency.computeIfAbsent(a, k -> new ArrayList<>()).add(b);
+            adjacency.computeIfAbsent(b, k -> new ArrayList<>()).add(a);
+          }
+        }
+      }
+    }
   }
 
   private int clamp_x(int p_x) {
@@ -275,10 +339,6 @@ public final class FreeSpacePartition {
    * Recomputes the free intervals of every slab whose left edge lies in [p_from_x, p_to_x).
    */
   private void rebuild_slab_range(int p_from_x, int p_to_x) {
-    cells = null;
-    adjacency = null;
-    rooms = null;
-    room_adjacency = null;
     // One slab wider on both sides than [p_from_x, p_to_x): a newly added edge can SPLIT a
     // pre-existing slab, leaving the portion before p_from_x with a stale entry keyed by the
     // old left edge, and the portion at/after p_to_x with no entry at all. (Found by the
@@ -287,12 +347,14 @@ public final class FreeSpacePartition {
     if (slab_left == null) {
       slab_left = slab_edges.first();
     }
+    int span_to = p_to_x;
     for (Integer left = slab_left; left != null; left = slab_edges.higher(left)) {
       Integer right = slab_edges.higher(left);
       if (right == null) {
         break;
       }
       free_intervals.put(left, compute_free_intervals(left, right));
+      span_to = Math.max(span_to, right);
       if (left >= p_to_x) {
         break;
       }
@@ -300,6 +362,9 @@ public final class FreeSpacePartition {
     // Drop stale entries for x values that are no longer slab lefts (edge set may have grown,
     // splitting a slab whose old entry would otherwise linger).
     free_intervals.keySet().removeIf(x -> !slab_edges.contains(x) || x.equals(slab_edges.last()));
+    if (cells != null) {
+      merge_range(stale_cell_ranges, slab_left, span_to);
+    }
   }
 
   /**
@@ -349,17 +414,14 @@ public final class FreeSpacePartition {
   }
 
   /**
-   * Builds cells (maximal horizontal merges of identical slab intervals) and their adjacency.
+   * Builds cells (maximal horizontal merges of identical slab intervals) from scratch.
    */
   private void build_cells() {
     cells = new ArrayList<>();
-    adjacency = new HashMap<>();
+    adjacency = null;
     // Open strips from the previous slab: y-interval -> cell start x. Iterated in slab order.
     Map<Long, int[]> open = new HashMap<>(); // key = packed interval, value = {startX, low, high}
     Map<Long, int[]> next_open;
-    // Cells finalized at each slab edge, for adjacency: right edge x -> cells ending there.
-    Map<Integer, List<Cell>> ended_at = new HashMap<>();
-    Map<Integer, List<Cell>> started_at = new HashMap<>();
 
     Integer left = slab_edges.first();
     while (left != null && !left.equals(slab_edges.last())) {
@@ -379,27 +441,129 @@ public final class FreeSpacePartition {
         }
       }
       // Whatever remains in `open` did not continue: finalize those cells at x = left.
-      finalize_open(open, left, ended_at, started_at);
+      finalize_open(open, left);
       open = next_open;
       left = right;
     }
-    finalize_open(open, slab_edges.last(), ended_at, started_at);
+    finalize_open(open, slab_edges.last());
+  }
 
-    // Adjacency: cells ending at edge x border cells starting at edge x where y-ranges overlap.
-    for (Map.Entry<Integer, List<Cell>> e : ended_at.entrySet()) {
-      List<Cell> starters = started_at.get(e.getKey());
-      if (starters == null) {
-        continue;
-      }
-      for (Cell a : e.getValue()) {
-        for (Cell b : starters) {
-          if (a.box.ll.y < b.box.ur.y && b.box.ll.y < a.box.ur.y) {
-            adjacency.computeIfAbsent(a, k -> new ArrayList<>()).add(b);
-            adjacency.computeIfAbsent(b, k -> new ArrayList<>()).add(a);
+  /**
+   * Splices the cell list over one stale slab span [p_a, p_b]: removes every cell overlapping
+   * the span's hull, re-sweeps that hull from the current intervals, and merges the boundary
+   * strips with the untouched cells they now continue into (absorption). The result must equal
+   * a from-scratch build -- verified by the randomized update-equivalence property tests.
+   */
+  private void update_cells_range(int p_a, int p_b) {
+    // Snap to live slab edges: endpoints recorded earlier may since have been deleted.
+    Integer a_edge = slab_edges.floor(p_a);
+    int a = a_edge == null ? slab_edges.first() : a_edge;
+    Integer b_edge = slab_edges.ceiling(p_b);
+    int b = b_edge == null ? slab_edges.last() : b_edge;
+    // Hull of cells touching [a, b] (closed: a cell ending exactly at `a` may now merge on),
+    // grown to a FIXPOINT: any cell overlapping the hull's open interior will be removed and
+    // re-swept, so its full span must lie inside the hull -- otherwise its tail beyond the
+    // hull is silently lost (caught by the update-equivalence property test).
+    int x0 = a;
+    int x1 = b;
+    boolean grew = true;
+    while (grew) {
+      grew = false;
+      for (Cell c : cells) {
+        boolean touches_range = c.box.ur.x >= a && c.box.ll.x <= b;
+        boolean overlaps_hull = c.box.ur.x > x0 && c.box.ll.x < x1;
+        if (touches_range || overlaps_hull) {
+          if (c.box.ll.x < x0) {
+            x0 = c.box.ll.x;
+            grew = true;
+          }
+          if (c.box.ur.x > x1) {
+            x1 = c.box.ur.x;
+            grew = true;
           }
         }
       }
     }
+    if (x0 >= x1) {
+      return;
+    }
+    // Keep cells whose span lies outside the OPEN hull; collect absorption candidates at the
+    // two hull boundaries (at most one per y-interval: two identically-intervalled cells
+    // meeting at an edge cannot both exist, they would have been merged).
+    List<Cell> kept = new ArrayList<>(cells.size());
+    Map<Long, Cell> absorb_left = new HashMap<>();
+    Map<Long, Cell> absorb_right = new HashMap<>();
+    for (Cell c : cells) {
+      if (c.box.ur.x > x0 && c.box.ll.x < x1) {
+        continue; // inside the hull: superseded by the re-sweep
+      }
+      kept.add(c);
+      if (c.box.ur.x == x0) {
+        absorb_left.put(pack(c.box.ll.y, c.box.ur.y), c);
+      }
+      if (c.box.ll.x == x1) {
+        absorb_right.put(pack(c.box.ll.y, c.box.ur.y), c);
+      }
+    }
+    java.util.Set<Cell> absorbed = new java.util.HashSet<>();
+    List<Cell> fresh = new ArrayList<>();
+    Map<Long, int[]> open = new HashMap<>();
+    int room_from = x0;
+    int room_to = x1;
+    Integer left = x0;
+    while (left != null && left < x1) {
+      Integer right = slab_edges.higher(left);
+      if (right == null) {
+        break;
+      }
+      List<int[]> intervals = free_intervals.getOrDefault(left, List.of());
+      Map<Long, int[]> next_open = new HashMap<>();
+      for (int[] iv : intervals) {
+        long key = pack(iv[0], iv[1]);
+        int[] existing = open.remove(key);
+        if (existing != null) {
+          next_open.put(key, existing);
+        } else {
+          int start = left;
+          if (left == x0) {
+            Cell continued = absorb_left.get(key);
+            if (continued != null && absorbed.add(continued)) {
+              start = continued.box.ll.x;
+              room_from = Math.min(room_from, start);
+            }
+          }
+          next_open.put(key, new int[]{start, iv[0], iv[1]});
+        }
+      }
+      for (int[] strip : open.values()) {
+        fresh.add(new Cell(new IntBox(strip[0], strip[1], left, strip[2])));
+      }
+      open = next_open;
+      left = right;
+    }
+    for (int[] strip : open.values()) {
+      long key = pack(strip[1], strip[2]);
+      int end = x1;
+      Cell continued = absorb_right.get(key);
+      if (continued != null && absorbed.add(continued)) {
+        end = continued.box.ur.x;
+        room_to = Math.max(room_to, end);
+      }
+      fresh.add(new Cell(new IntBox(strip[0], strip[1], end, strip[2])));
+    }
+    List<Cell> spliced = new ArrayList<>(kept.size() + fresh.size());
+    for (Cell c : kept) {
+      if (!absorbed.contains(c)) {
+        spliced.add(c);
+      }
+    }
+    spliced.addAll(fresh);
+    for (int i = 0; i < spliced.size(); i++) {
+      spliced.get(i).index = i;
+    }
+    cells = spliced;
+    adjacency = null;
+    merge_range(stale_room_ranges, room_from, room_to);
   }
 
   /**
@@ -425,13 +589,22 @@ public final class FreeSpacePartition {
 
   private List<Room> rooms;
   private Map<Room, List<Room>> room_adjacency;
+  private java.util.Set<RoomKey> room_keys;
 
   /**
-   * The current room cover, rebuilt on demand after mutations; must not be mutated.
+   * The current room cover. Brought up to date on demand -- built once, then locally updated
+   * over the accumulated stale spans (invalidate touched rooms, re-extend the cells that can
+   * regenerate them, dedup against the kept rooms). Must not be mutated by the caller.
    */
   public List<Room> rooms() {
+    cells();
     if (rooms == null) {
       build_rooms();
+      stale_room_ranges.clear();
+    } else if (!stale_room_ranges.isEmpty()) {
+      List<Map.Entry<Integer, Integer>> pending = new ArrayList<>(stale_room_ranges.entrySet());
+      stale_room_ranges.clear();
+      update_rooms(pending);
     }
     return rooms;
   }
@@ -466,17 +639,21 @@ public final class FreeSpacePartition {
   private record RoomKey(int left, int right, int lo, int hi) {
   }
 
-  private void build_rooms() {
-    // Flatten the slab structure into arrays once: extension walks over TreeSet navigation
-    // with linear interval scans measured at ~66 ms per build, ~26 s per routing pass.
-    List<Cell> cell_list = cells();
+  /**
+   * The slab structure flattened into arrays: extension walks over TreeSet navigation with
+   * linear interval scans measured at ~66 ms per build, ~26 s per routing pass. Per slab i
+   * (left edge edges[i]): free interval bounds sorted by low; intervals are disjoint, so the
+   * only candidate to contain [lo, hi] is the last one with low <= lo.
+   */
+  private record FlatSlabs(int[] edges, int edge_count, int[][] lows, int[][] highs) {
+  }
+
+  private FlatSlabs flatten_slabs() {
     int[] edges = new int[slab_edges.size()];
     int edge_count = 0;
     for (int edge : slab_edges) {
       edges[edge_count++] = edge;
     }
-    // Per slab i (left edge edges[i]): free interval bounds, sorted by low; intervals are
-    // disjoint, so the only candidate to contain [lo, hi] is the last one with low <= lo.
     int[][] slab_lows = new int[edge_count][];
     int[][] slab_highs = new int[edge_count][];
     for (int i = 0; i + 1 < edge_count; i++) {
@@ -493,43 +670,167 @@ public final class FreeSpacePartition {
       slab_lows[i] = lows;
       slab_highs[i] = highs;
     }
+    return new FlatSlabs(edges, edge_count, slab_lows, slab_highs);
+  }
 
+  /**
+   * The horizontally-maximal extension of one cell, or null when the cell's edges are not live
+   * slab edges (cannot happen for a fresh cell list; defensive).
+   */
+  private static RoomKey extend_cell(Cell p_cell, FlatSlabs p_slabs) {
+    int lo = p_cell.box.ll.y;
+    int hi = p_cell.box.ur.y;
+    int left_index = java.util.Arrays.binarySearch(p_slabs.edges, 0, p_slabs.edge_count, p_cell.box.ll.x);
+    int right_index = java.util.Arrays.binarySearch(p_slabs.edges, 0, p_slabs.edge_count, p_cell.box.ur.x);
+    if (left_index < 0 || right_index < 0) {
+      return null;
+    }
+    while (left_index > 0 && slab_contains(p_slabs.lows[left_index - 1], p_slabs.highs[left_index - 1], lo, hi)) {
+      --left_index;
+    }
+    while (right_index + 1 < p_slabs.edge_count
+        && slab_contains(p_slabs.lows[right_index], p_slabs.highs[right_index], lo, hi)) {
+      ++right_index;
+    }
+    return new RoomKey(p_slabs.edges[left_index], p_slabs.edges[right_index], lo, hi);
+  }
+
+  private void build_rooms() {
+    FlatSlabs slabs = flatten_slabs();
     rooms = new ArrayList<>();
     room_adjacency = new HashMap<>();
-    java.util.Set<RoomKey> seen = new java.util.HashSet<>();
-    for (Cell c : cell_list) {
-      int lo = c.box.ll.y;
-      int hi = c.box.ur.y;
-      int left_index = java.util.Arrays.binarySearch(edges, 0, edge_count, c.box.ll.x);
-      int right_index = java.util.Arrays.binarySearch(edges, 0, edge_count, c.box.ur.x);
-      if (left_index < 0 || right_index < 0) {
-        continue; // cell edges are always slab edges; defensive
-      }
-      while (left_index > 0 && slab_contains(slab_lows[left_index - 1], slab_highs[left_index - 1], lo, hi)) {
-        --left_index;
-      }
-      while (right_index + 1 < edge_count
-          && slab_contains(slab_lows[right_index], slab_highs[right_index], lo, hi)) {
-        ++right_index;
-      }
-      if (seen.add(new RoomKey(edges[left_index], edges[right_index], lo, hi))) {
-        Room room = new Room(new IntBox(edges[left_index], lo, edges[right_index], hi));
+    room_keys = new java.util.HashSet<>();
+    for (Cell c : cells) {
+      RoomKey key = extend_cell(c, slabs);
+      if (key != null && room_keys.add(key)) {
+        Room room = new Room(new IntBox(key.left(), key.lo(), key.right(), key.hi()));
         room.index = rooms.size();
         rooms.add(room);
       }
     }
     for (int i = 0; i < rooms.size(); i++) {
       for (int j = i + 1; j < rooms.size(); j++) {
-        IntBox a = rooms.get(i).box;
-        IntBox b = rooms.get(j).box;
-        int dx = Math.min(a.ur.x, b.ur.x) - Math.max(a.ll.x, b.ll.x);
-        int dy = Math.min(a.ur.y, b.ur.y) - Math.max(a.ll.y, b.ll.y);
-        if (dx >= 0 && dy >= 0 && (dx > 0 || dy > 0)) {
+        if (rooms_share_region(rooms.get(i).box, rooms.get(j).box)) {
           room_adjacency.computeIfAbsent(rooms.get(i), k -> new ArrayList<>()).add(rooms.get(j));
           room_adjacency.computeIfAbsent(rooms.get(j), k -> new ArrayList<>()).add(rooms.get(i));
         }
       }
     }
+  }
+
+  private static boolean rooms_share_region(IntBox p_a, IntBox p_b) {
+    int dx = Math.min(p_a.ur.x, p_b.ur.x) - Math.max(p_a.ll.x, p_b.ll.x);
+    int dy = Math.min(p_a.ur.y, p_b.ur.y) - Math.max(p_a.ll.y, p_b.ll.y);
+    return dx >= 0 && dy >= 0 && (dx > 0 || dy > 0);
+  }
+
+  /**
+   * Locally updates the room cover over the accumulated stale spans, applied in ONE batch (a
+   * per-span version re-flattened the slabs and re-scanned per span, which was measured
+   * slower than the wholesale rebuild it replaced). Every room touching a span is invalid
+   * (its extension read intervals that changed, or it should now extend further). The seeds
+   * able to regenerate every replacement are exactly the cells TOUCHING the spans: extension
+   * is maximal, so any single cell of a fragment regenerates the whole fragment, and a
+   * fragment of a split room always owns a cell ending at or inside the changed span.
+   * Deduplication against the kept rooms' keys makes regeneration idempotent. Must equal a
+   * from-scratch build -- property-tested.
+   */
+  private void update_rooms(List<Map.Entry<Integer, Integer>> p_ranges) {
+    List<Room> invalid = new ArrayList<>();
+    List<Room> survivors = new ArrayList<>(rooms.size());
+    for (Room r : rooms) {
+      if (touches_any(r.box.ll.x, r.box.ur.x, p_ranges)) {
+        invalid.add(r);
+      } else {
+        survivors.add(r);
+      }
+    }
+    java.util.Set<Room> invalid_set = new java.util.HashSet<>(invalid);
+    for (Room r : invalid) {
+      room_keys.remove(new RoomKey(r.box.ll.x, r.box.ur.x, r.box.ll.y, r.box.ur.y));
+      List<Room> neighbor_list = room_adjacency.remove(r);
+      if (neighbor_list != null) {
+        for (Room neighbor : neighbor_list) {
+          if (!invalid_set.contains(neighbor)) {
+            List<Room> back = room_adjacency.get(neighbor);
+            if (back != null) {
+              back.remove(r);
+            }
+          }
+        }
+      }
+    }
+    rooms = survivors;
+    FlatSlabs slabs = flatten_slabs();
+    // Seeds: cells touching a span (new/changed cells, fragment boundary cells) PLUS the
+    // DEFINING cells of every removed room -- cells whose exact y-interval equals the room's,
+    // inside its span. A still-valid removed room, or a fragment pinched far from the span,
+    // is regenerated only by such a cell; span-touching cells at wider slabs extend to WIDER
+    // rooms, not to it (a gap the property tests catch without this).
+    java.util.Set<Cell> seeds = new java.util.LinkedHashSet<>();
+    Map<Long, List<Cell>> cells_by_interval = new HashMap<>();
+    for (Cell c : cells) {
+      if (touches_any(c.box.ll.x, c.box.ur.x, p_ranges)) {
+        seeds.add(c);
+      }
+      cells_by_interval.computeIfAbsent(pack(c.box.ll.y, c.box.ur.y), k -> new ArrayList<>()).add(c);
+    }
+    for (Room r : invalid) {
+      List<Cell> defining = cells_by_interval.get(pack(r.box.ll.y, r.box.ur.y));
+      if (defining == null) {
+        continue;
+      }
+      for (Cell c : defining) {
+        if (c.box.ll.x >= r.box.ll.x && c.box.ur.x <= r.box.ur.x) {
+          seeds.add(c);
+        }
+      }
+    }
+    List<Room> added = new ArrayList<>();
+    for (Cell c : seeds) {
+      RoomKey key = extend_cell(c, slabs);
+      if (key != null && room_keys.add(key)) {
+        Room room = new Room(new IntBox(key.left(), key.lo(), key.right(), key.hi()));
+        added.add(room);
+      }
+    }
+    // Link fresh rooms: against survivors first, then fresh-fresh pairs -- indexed loops so
+    // no membership scans are needed.
+    for (Room fresh : added) {
+      for (Room survivor : rooms) {
+        if (rooms_share_region(fresh.box, survivor.box)) {
+          room_adjacency.computeIfAbsent(fresh, k -> new ArrayList<>()).add(survivor);
+          room_adjacency.computeIfAbsent(survivor, k -> new ArrayList<>()).add(fresh);
+        }
+      }
+    }
+    for (int i = 0; i < added.size(); i++) {
+      for (int j = i + 1; j < added.size(); j++) {
+        if (rooms_share_region(added.get(i).box, added.get(j).box)) {
+          room_adjacency.computeIfAbsent(added.get(i), k -> new ArrayList<>()).add(added.get(j));
+          room_adjacency.computeIfAbsent(added.get(j), k -> new ArrayList<>()).add(added.get(i));
+        }
+      }
+    }
+    rooms.addAll(added);
+    for (int i = 0; i < rooms.size(); i++) {
+      rooms.get(i).index = i;
+    }
+  }
+
+  /**
+   * Whether [p_from, p_to] touches (closed) any of the disjoint ascending ranges.
+   */
+  private static boolean touches_any(int p_from, int p_to, List<Map.Entry<Integer, Integer>> p_ranges) {
+    for (Map.Entry<Integer, Integer> range : p_ranges) {
+      if (range.getKey() > p_to) {
+        return false;
+      }
+      if (range.getValue() >= p_from) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -546,14 +847,11 @@ public final class FreeSpacePartition {
     return idx >= 0 && p_highs[idx] >= p_hi;
   }
 
-  private void finalize_open(Map<Long, int[]> p_open, int p_end_x,
-      Map<Integer, List<Cell>> p_ended_at, Map<Integer, List<Cell>> p_started_at) {
+  private void finalize_open(Map<Long, int[]> p_open, int p_end_x) {
     for (int[] strip : p_open.values()) {
       Cell cell = new Cell(new IntBox(strip[0], strip[1], p_end_x, strip[2]));
       cell.index = cells.size();
       cells.add(cell);
-      p_ended_at.computeIfAbsent(p_end_x, k -> new ArrayList<>()).add(cell);
-      p_started_at.computeIfAbsent(strip[0], k -> new ArrayList<>()).add(cell);
     }
     p_open.clear();
   }
