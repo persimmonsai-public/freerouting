@@ -179,17 +179,45 @@ reproduced in 4 of 4 runs — better than the 989.72 / 2 baseline.** Pass-1 hit 
 the lifted net into to-be-rebuilt partitions; array-based extension walks with
 binary-search containment — `t_rooms` was 26.5 s of pass 1 alone before these).
 
-**Cost anatomy and what remains.** Per-attempt freshness is load-bearing for quality
-(amortizing invalidation to every 8th attempt saved almost nothing — 141 s vs 145 s — while
-dropping the score to 979.47/4, below gate), and the remaining overhead is `build_cells` +
-`build_rooms` running whole-board on every attempt because only the slab INTERVALS update
-locally today. The design's "updates are local" promise must be extended to cells and
-rooms: incremental cell/room maintenance over the lift's dirty ranges is the single
-remaining item between "quality mode at 3x cost" and a genuine win. Raising the pass-1 hit
-rate beyond 11/199 (residual rejects: 110) would then directly convert classic search time
-into ~1 ms partition successes.
+**Cost anatomy.** Per-attempt freshness is load-bearing for quality (amortizing
+invalidation to every 8th attempt saved almost nothing — 141 s vs 145 s — while dropping
+the score to 979.47/4, below gate); the overhead is `build_cells` + `build_rooms` running
+whole-board on every attempt because only the slab INTERVALS update locally.
 
-The flag stays default-off; flag-off behavior is unchanged.
+## Stage 3d — incremental cell/room maintenance: REFUTED by measurement
+
+The obvious fix was implemented in full: stale-range accumulation, local cell splicing
+(fixpoint hulls, boundary absorption), batched room invalidate+reseed (span-touching cells
+plus the defining cells of removed rooms) with key dedup and incremental adjacency, and
+diff-based partition synchronization recognizing unchanged items by reference-identical
+tree-shape lists. Equivalence with from-scratch builds is property-tested — the tests
+caught a real splice-hull bug on the first run.
+
+Measured: **137 s vs the 111 s wholesale path it was meant to beat** (first, unbatched
+version: ~240 s), same score. On this geometry locality does not pay: maximal rooms span
+the board, so any change invalidates hundreds of corridor rooms, and the "local" update
+performs wholesale-scale extension work plus splice and adjacency bookkeeping. The
+implementation is preserved on branch `perf/partition-incremental-refuted`; the main
+branch stays on the wholesale path.
+
+## Stage 3e — early-pass gating: the current best configuration
+
+Partition successes concentrate where the board is still open — measured 11 of 12 in pass
+1, the remainder in pass 2, none later — while every attempt pays the freshness cost.
+Attempting only in pass 1:
+
+| configuration | wall clock | final score |
+|---|---|---|
+| flag off (baseline) | 37.4 s | 989.72 / 2 unrouted / 0 violations |
+| flag on, all passes | 111 s | 994.85 / 1 unrouted / 0 violations |
+| flag on, passes 1-2 | 77 s | 994.85 / 1 unrouted / 0 violations |
+| **flag on, pass 1 only** | **57.9 s** | **994.85 / 1 unrouted / 0 violations** |
+
+The flag is therefore an explicit **quality mode**: +55% wall clock for a better final
+score and one fewer unrouted net, deterministic across runs. What would move it further:
+raising the pass-1 hit rate beyond 11/199 (residual rejects 110 — each conversion replaces
+a classic maze search with a ~1 ms partition success), and via support to widen the
+eligible connection set. The flag stays default-off; flag-off behavior is unchanged.
 
 Gate protocol unchanged: three isolated runs, `--no-build-cache`, score ≥ 989.72,
 ≤ 2 unrouted, 0 violations, and wall-clock only after the gate.

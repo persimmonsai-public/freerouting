@@ -1800,7 +1800,10 @@ public class BatchAutorouter extends NamedAlgorithm {
       // Stage-2 partition router: try the cheap canonical-partition search first; any
       // failure, unsupported case, or commit-time conflict falls through to the classic
       // engine below, so the worst case is the status quo plus a fast failed attempt.
-      if (isPartitionRouterEnabled() && !contains_plane) {
+      // Early passes only: partition successes concentrate where the board is still open
+      // (measured: 11 of 12 in pass 1, the rest in pass 2, none later), while every attempt
+      // pays the per-attempt freshness cost -- late-pass attempts are pure overhead.
+      if (isPartitionRouterEnabled() && !contains_plane && p_ripup_pass_no <= 1) {
         AutorouteAttemptResult partition_result = try_partition_route(route_start_set, route_dest_set,
             autoroute_control);
         if (partition_result != null) {
