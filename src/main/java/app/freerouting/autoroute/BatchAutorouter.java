@@ -1862,9 +1862,11 @@ public class BatchAutorouter extends NamedAlgorithm {
       if (partition_router != null) {
         // Every path through here may have mutated the board (classic engine commit, ripup,
         // necked retry, pull-tight); a partition that misses freshly committed copper plans
-        // routes through occupied space and every later attempt fails the insertability
-        // check (measured: conflicts were dominated by high-id items inserted earlier in the
-        // same pass, and rejects cascaded to ~100%). The rebuild itself stays lazy.
+        // routes through occupied space and later attempts fail the insertability check.
+        // Refresh every attempt: amortizing to every 8th attempt was measured to save almost
+        // no wall-clock (140.9 s vs 145 s -- the rebuild is not the dominant cost) while
+        // dropping the final score below the gate (979.47/4 vs 994.85/1): stale plans that
+        // still pass the pre-insert check commit worse routes.
         partition_router.invalidate();
       }
     }

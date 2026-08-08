@@ -463,31 +463,57 @@ public final class FreeSpacePartition {
     return result == null ? List.of() : result;
   }
 
+  private record RoomKey(int left, int right, int lo, int hi) {
+  }
+
   private void build_rooms() {
+    // Flatten the slab structure into arrays once: extension walks over TreeSet navigation
+    // with linear interval scans measured at ~66 ms per build, ~26 s per routing pass.
+    List<Cell> cell_list = cells();
+    int[] edges = new int[slab_edges.size()];
+    int edge_count = 0;
+    for (int edge : slab_edges) {
+      edges[edge_count++] = edge;
+    }
+    // Per slab i (left edge edges[i]): free interval bounds, sorted by low; intervals are
+    // disjoint, so the only candidate to contain [lo, hi] is the last one with low <= lo.
+    int[][] slab_lows = new int[edge_count][];
+    int[][] slab_highs = new int[edge_count][];
+    for (int i = 0; i + 1 < edge_count; i++) {
+      List<int[]> intervals = free_intervals.get(edges[i]);
+      if (intervals == null) {
+        continue;
+      }
+      int[] lows = new int[intervals.size()];
+      int[] highs = new int[intervals.size()];
+      for (int k = 0; k < intervals.size(); k++) {
+        lows[k] = intervals.get(k)[0];
+        highs[k] = intervals.get(k)[1];
+      }
+      slab_lows[i] = lows;
+      slab_highs[i] = highs;
+    }
+
     rooms = new ArrayList<>();
     room_adjacency = new HashMap<>();
-    java.util.Set<String> seen = new java.util.HashSet<>();
-    for (Cell c : cells()) {
+    java.util.Set<RoomKey> seen = new java.util.HashSet<>();
+    for (Cell c : cell_list) {
       int lo = c.box.ll.y;
       int hi = c.box.ur.y;
-      int left = c.box.ll.x;
-      while (left > bounds.ll.x) {
-        Integer prev = slab_edges.lower(left);
-        if (prev == null || !interval_contained(prev, lo, hi)) {
-          break;
-        }
-        left = prev;
+      int left_index = java.util.Arrays.binarySearch(edges, 0, edge_count, c.box.ll.x);
+      int right_index = java.util.Arrays.binarySearch(edges, 0, edge_count, c.box.ur.x);
+      if (left_index < 0 || right_index < 0) {
+        continue; // cell edges are always slab edges; defensive
       }
-      int right = c.box.ur.x;
-      while (right < bounds.ur.x && interval_contained(right, lo, hi)) {
-        Integer next = slab_edges.higher(right);
-        if (next == null) {
-          break;
-        }
-        right = next;
+      while (left_index > 0 && slab_contains(slab_lows[left_index - 1], slab_highs[left_index - 1], lo, hi)) {
+        --left_index;
       }
-      if (seen.add(left + ":" + right + ":" + lo + ":" + hi)) {
-        Room room = new Room(new IntBox(left, lo, right, hi));
+      while (right_index + 1 < edge_count
+          && slab_contains(slab_lows[right_index], slab_highs[right_index], lo, hi)) {
+        ++right_index;
+      }
+      if (seen.add(new RoomKey(edges[left_index], edges[right_index], lo, hi))) {
+        Room room = new Room(new IntBox(edges[left_index], lo, edges[right_index], hi));
         room.index = rooms.size();
         rooms.add(room);
       }
@@ -507,20 +533,17 @@ public final class FreeSpacePartition {
   }
 
   /**
-   * Whether the slab whose left edge is p_slab_left has a free interval containing
-   * [p_lo, p_hi].
+   * Whether one of the disjoint sorted free intervals (p_lows/p_highs) contains [p_lo, p_hi].
    */
-  private boolean interval_contained(int p_slab_left, int p_lo, int p_hi) {
-    List<int[]> intervals = free_intervals.get(p_slab_left);
-    if (intervals == null) {
+  private static boolean slab_contains(int[] p_lows, int[] p_highs, int p_lo, int p_hi) {
+    if (p_lows == null || p_lows.length == 0) {
       return false;
     }
-    for (int[] iv : intervals) {
-      if (iv[0] <= p_lo && iv[1] >= p_hi) {
-        return true;
-      }
+    int idx = java.util.Arrays.binarySearch(p_lows, p_lo);
+    if (idx < 0) {
+      idx = -idx - 2; // last interval with low <= p_lo
     }
-    return false;
+    return idx >= 0 && p_highs[idx] >= p_hi;
   }
 
   private void finalize_open(Map<Long, int[]> p_open, int p_end_x,

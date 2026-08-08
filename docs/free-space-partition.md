@@ -153,13 +153,43 @@ Measured (same fixture, flag on, partition invalidated after every attempt for s
   ~150 ms even after bulk-building (`ensure_fresh` now uses begin/end_bulk; a from-scratch
   build without bulk was measured at ~240 ms/attempt, +47 s per pass).
 
-Remaining, in value order: (1) observer-driven incremental maintenance instead of
-per-attempt wholesale rebuilds; (2) terminal-room handling — Locate also erodes the
-start/target rooms, and the A*-side exemption does not help Locate itself, which likely
-drives most of the residual 94 rejects (fine-pitch exits again, now at the ends only);
-(3) path-cost shaping so partition routes stop being serpentines (cost on door-crossing
-turns, not just center distance). The flag stays default-off; flag-off behavior is
-unchanged.
+## Stage 3c — windowed channels: the router now BEATS the baseline score
+
+Two further refuted hypotheses first, both measured: fatter terminal rooms (rejects
+94 -> 106) and channel-clipping rooms to their raw joints (no change — consecutive maximal
+rooms overlap over most of their length, so raw joints are nearly as large as the rooms).
+
+The real mechanism, found by reading `LocateFoundConnectionAlgo45Degree`: between
+overlapping rooms every door is 2-dimensional, and for those Locate IGNORES the door
+sections chosen at materialization — each step is a greedy nearest-point move, and the
+dogleg corners it inserts are never validated against anything. Inside 100k+-unit maximal
+rooms the walk drifts freely, and the final unchecked dogleg to the pad centre ran straight
+down the pin column (the reject signature: second segment crossing 5+ neighbouring pins).
+
+**The fix (windowed channels):** materialize narrows each interior joint to a WINDOW — the
+straight start-to-target aim line's interpolated point clamped into the joint, inflated by
+the pass width — and hands Locate each room clipped to the bounding box of its entry and
+exit windows. Inside one axis-aligned box every dogleg between two interior points is
+contained by convexity, so the realized polyline is legal by construction, and the channel
+follows the aim line, which also fixed route quality.
+
+Measured (flag on, reference fixture): **final score 994.85 / 1 unrouted / 0 violations,
+reproduced in 4 of 4 runs — better than the 989.72 / 2 baseline.** Pass-1 hit rate 11 of
+199. Wall-clock 111 s vs 37.4 s baseline after profiling-driven fixes (skip re-inserting
+the lifted net into to-be-rebuilt partitions; array-based extension walks with
+binary-search containment — `t_rooms` was 26.5 s of pass 1 alone before these).
+
+**Cost anatomy and what remains.** Per-attempt freshness is load-bearing for quality
+(amortizing invalidation to every 8th attempt saved almost nothing — 141 s vs 145 s — while
+dropping the score to 979.47/4, below gate), and the remaining overhead is `build_cells` +
+`build_rooms` running whole-board on every attempt because only the slab INTERVALS update
+locally today. The design's "updates are local" promise must be extended to cells and
+rooms: incremental cell/room maintenance over the lift's dirty ranges is the single
+remaining item between "quality mode at 3x cost" and a genuine win. Raising the pass-1 hit
+rate beyond 11/199 (residual rejects: 110) would then directly convert classic search time
+into ~1 ms partition successes.
+
+The flag stays default-off; flag-off behavior is unchanged.
 
 Gate protocol unchanged: three isolated runs, `--no-build-cache`, score ≥ 989.72,
 ≤ 2 unrouted, 0 violations, and wall-clock only after the gate.

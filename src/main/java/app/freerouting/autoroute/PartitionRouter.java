@@ -173,33 +173,10 @@ public final class PartitionRouter {
       }
       return best;
     } finally {
-      for (int layer = 0; layer < partitions.length; layer++) {
-        FreeSpacePartition partition = partitions[layer];
-        if (partition == null) {
-          continue;
-        }
-        partition.begin_bulk();
-        for (Item item : net_items) {
-          List<TileShape> shapes = null;
-          int shape_count = item.tree_shape_count(tree);
-          for (int i = 0; i < shape_count; i++) {
-            if (item.shape_layer(i) != layer) {
-              continue;
-            }
-            TileShape shape = item.get_tree_shape(tree, i);
-            if (shape != null && !shape.is_empty()) {
-              if (shapes == null) {
-                shapes = new ArrayList<>(2);
-              }
-              shapes.add(shape);
-            }
-          }
-          if (shapes != null) {
-            partition.insert(item.get_id_no(), shapes);
-          }
-        }
-        partition.end_bulk();
-      }
+      // Every attempt is followed by invalidate() from the caller (staleness-vs-quality
+      // tradeoff measured in BatchAutorouter), so re-inserting the lifted net into
+      // partitions that are about to be rebuilt wholesale is pure waste; just mark dirty.
+      dirty = true;
     }
   }
 
@@ -216,11 +193,8 @@ public final class PartitionRouter {
     FreeSpacePartition partition = partitions[p_layer];
     // Rooms abutting an item shape, with the shape's tree entry number for door construction.
     Map<FreeSpacePartition.Room, ItemContact> starts = contact_rooms(partition, p_start_set, p_layer, p_half_width, false);
-    if (starts.isEmpty()) {
-      return null;
-    }
     Map<FreeSpacePartition.Room, ItemContact> targets = contact_rooms(partition, p_dest_set, p_layer, p_half_width, true);
-    if (targets.isEmpty()) {
+    if (starts.isEmpty() || targets.isEmpty()) {
       return null;
     }
 
@@ -241,6 +215,14 @@ public final class PartitionRouter {
     java.util.Arrays.fill(came_from, -1);
     PriorityQueue<double[]> open = new PriorityQueue<>((a, b) -> Double.compare(a[0], b[0]));
     for (FreeSpacePartition.Room start : starts.keySet()) {
+      // Thin terminal rooms are excluded outright: Locate erodes start/target rooms exactly
+      // like intermediate ones, and a thin terminal degenerates the whole corner walk
+      // (measured: rejected plans' first segments ran ALONG the pin row, clipping the
+      // neighbouring pins over 100k+ units). Better a clean no-route here than degenerate
+      // geometry rejected after realization.
+      if (start.box.ur.x - start.box.ll.x < min_pass || start.box.ur.y - start.box.ll.y < min_pass) {
+        continue;
+      }
       g[start.index] = 0;
       open.add(new double[]{heuristic(start, targets.keySet()), start.index});
     }
@@ -261,10 +243,9 @@ public final class PartitionRouter {
         if (closed[neighbor.index]) {
           continue;
         }
-        if (!targets.containsKey(neighbor) && !starts.containsKey(neighbor)
-            && (neighbor.box.ur.x - neighbor.box.ll.x < min_pass
-                || neighbor.box.ur.y - neighbor.box.ll.y < min_pass)) {
-          continue; // too thin for Locate's interior erosion
+        if (neighbor.box.ur.x - neighbor.box.ll.x < min_pass
+            || neighbor.box.ur.y - neighbor.box.ll.y < min_pass) {
+          continue; // too thin for Locate's interior erosion (terminal rooms included)
         }
         int dx = Math.min(room.box.ur.x, neighbor.box.ur.x) - Math.max(room.box.ll.x, neighbor.box.ll.x);
         int dy = Math.min(room.box.ur.y, neighbor.box.ur.y) - Math.max(room.box.ll.y, neighbor.box.ll.y);
@@ -367,9 +348,61 @@ public final class PartitionRouter {
     int half_width = p_ctrl.compensated_trace_half_width[layer];
     List<FreeSpacePartition.Room> path = p_route.rooms;
 
+    // Rooms handed to Locate are the path rooms CLIPPED to the channel the route actually
+    // needs: the bounding box of each room's entry joint and exit joint (terminal attachment
+    // shapes at the ends), inflated by the pass width. Locate's 45-degree corner walk places
+    // unchecked dogleg corners between the current point and the next nearest point; inside
+    // one axis-aligned box any such dogleg is contained by convexity, but across the
+    // 100k+-unit maximal rooms the walk drifts and the final legs ran straight down pin
+    // columns (measured: the dominant reject signature). Clipping bounds the drift while
+    // keeping every shape a subset of known-free space.
+    int channel_margin = 2 * (half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
+    IntBox[] joints = new IntBox[path.size() + 1];
+    TileShape start_shape = p_route.start_item.get_tree_shape(tree, p_route.start_tree_entry_no);
+    if (start_shape == null || start_shape.is_empty()) {
+      return null;
+    }
+    joints[0] = start_shape.bounding_box().intersection(path.get(0).box);
+    for (int i = 1; i < path.size(); i++) {
+      joints[i] = path.get(i - 1).box.intersection(path.get(i).box);
+    }
+    TileShape target_shape = p_route.target_item.get_tree_shape(tree, p_route.target_tree_entry_no);
+    if (target_shape == null || target_shape.is_empty()) {
+      return null;
+    }
+    joints[path.size()] = target_shape.bounding_box().intersection(path.get(path.size() - 1).box);
+    for (IntBox joint : joints) {
+      if (joint.is_empty()) {
+        return null;
+      }
+    }
+    // Consecutive maximal rooms overlap over most of their length, so a raw joint is nearly
+    // as large as the rooms and clipping to it changes nothing. Interior joints are therefore
+    // narrowed to a WINDOW: the straight start-to-target aim line's interpolated point,
+    // clamped into the joint (so the window stays in known-free overlap), inflated by the
+    // pass width. The channels below then follow the aim line instead of the full corridors.
+    double aim_from_x = (joints[0].ll.x + joints[0].ur.x) / 2.0;
+    double aim_from_y = (joints[0].ll.y + joints[0].ur.y) / 2.0;
+    double aim_to_x = (joints[path.size()].ll.x + joints[path.size()].ur.x) / 2.0;
+    double aim_to_y = (joints[path.size()].ll.y + joints[path.size()].ur.y) / 2.0;
+    for (int i = 1; i < path.size(); i++) {
+      double t = i / (double) path.size();
+      int window_x = (int) Math.round(aim_from_x + t * (aim_to_x - aim_from_x));
+      int window_y = (int) Math.round(aim_from_y + t * (aim_to_y - aim_from_y));
+      window_x = Math.max(joints[i].ll.x, Math.min(joints[i].ur.x, window_x));
+      window_y = Math.max(joints[i].ll.y, Math.min(joints[i].ur.y, window_y));
+      joints[i] = new IntBox(window_x, window_y, window_x, window_y)
+          .offset(channel_margin).intersection(joints[i]);
+    }
+
     List<CompleteFreeSpaceExpansionRoom> rooms = new ArrayList<>(path.size());
     for (int i = 0; i < path.size(); i++) {
-      rooms.add(new CompleteFreeSpaceExpansionRoom(path.get(i).box, layer, i + 1));
+      IntBox channel = joints[i].union(joints[i + 1]).offset(channel_margin)
+          .intersection(path.get(i).box);
+      if (channel.is_empty()) {
+        return null;
+      }
+      rooms.add(new CompleteFreeSpaceExpansionRoom(channel, layer, i + 1));
     }
 
     TargetItemExpansionDoor start_door =
