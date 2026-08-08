@@ -165,6 +165,15 @@ public final class PartitionRouter {
             Math.max(1, p_half_width[layer]));
         if (route != null) {
           double cost = route_length(route);
+          // Quality guard: a partition route much longer than the straight terminal distance
+          // is a detour that blocks corridors the endgame needs -- committing such routes was
+          // measured to drop the final score from 994.85/1 to baseline 989.72/2 when the
+          // sentinel fix doubled the raw hit rate. Let the classic engine route those.
+          double direct = center_distance(route.rooms.get(0).box,
+              route.rooms.get(route.rooms.size() - 1).box);
+          if (cost > 1.4 * direct + 20000) {
+            continue;
+          }
           if (cost < best_cost) {
             best_cost = cost;
             best = route;
@@ -192,7 +201,11 @@ public final class PartitionRouter {
       int p_half_width) {
     FreeSpacePartition partition = partitions[p_layer];
     // Rooms abutting an item shape, with the shape's tree entry number for door construction.
-    Map<FreeSpacePartition.Room, ItemContact> starts = contact_rooms(partition, p_start_set, p_layer, p_half_width, false);
+    // Both sides require the CONNECTION shape to reach the room: Locate walks toward the
+    // start item's connection shape intersected with the start room (a trace's connection
+    // shape exists only near its endpoints), and an empty intersection makes its target
+    // corner land on the 2^25 sentinel coordinate -- measured as the dominant reject.
+    Map<FreeSpacePartition.Room, ItemContact> starts = contact_rooms(partition, p_start_set, p_layer, p_half_width, true);
     Map<FreeSpacePartition.Room, ItemContact> targets = contact_rooms(partition, p_dest_set, p_layer, p_half_width, true);
     if (starts.isEmpty() || targets.isEmpty()) {
       return null;
@@ -374,7 +387,12 @@ public final class PartitionRouter {
     // keeping every shape a subset of known-free space.
     int channel_margin = 2 * (half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
     IntBox[] joints = new IntBox[path.size() + 1];
-    TileShape start_shape = p_route.start_item.get_tree_shape(tree, p_route.start_tree_entry_no);
+    // Terminal joints come from the CONNECTION shapes (what Locate actually attaches to),
+    // not the tree shapes: the channel must contain the attachment region or Locate's
+    // approach degenerates to the sentinel corner. An unbounded trace-connection simplex has
+    // a sentinel-sized bounding box; the intersection with the room bounds it.
+    TileShape start_shape = ((app.freerouting.board.Connectable) p_route.start_item)
+        .get_trace_connection_shape(tree, p_route.start_tree_entry_no);
     if (start_shape == null || start_shape.is_empty()) {
       return null;
     }
@@ -382,7 +400,8 @@ public final class PartitionRouter {
     for (int i = 1; i < path.size(); i++) {
       joints[i] = path.get(i - 1).box.intersection(path.get(i).box);
     }
-    TileShape target_shape = p_route.target_item.get_tree_shape(tree, p_route.target_tree_entry_no);
+    TileShape target_shape = ((app.freerouting.board.Connectable) p_route.target_item)
+        .get_trace_connection_shape(tree, p_route.target_tree_entry_no);
     if (target_shape == null || target_shape.is_empty()) {
       return null;
     }
