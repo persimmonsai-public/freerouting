@@ -30,6 +30,7 @@ import app.freerouting.geometry.planar.FloatLine;
 import app.freerouting.geometry.planar.FloatPoint;
 import app.freerouting.geometry.planar.IntBox;
 import app.freerouting.geometry.planar.Point;
+import app.freerouting.geometry.planar.Polyline;
 import app.freerouting.logger.FRLogger;
 import app.freerouting.rules.Net;
 import app.freerouting.settings.RouterSettings;
@@ -445,7 +446,7 @@ public class BatchAutorouter extends NamedAlgorithm {
    */
   private long partition_routed_count;
   private long partition_fallback_count;
-
+  private long partition_drc_reject_count;
   /**
    * Attempts the connection over the free-space partition. Returns a ROUTED result on success,
    * or null when the classic engine should handle the connection instead (no route found in the
@@ -477,16 +478,46 @@ public class BatchAutorouter extends NamedAlgorithm {
         ++partition_fallback_count;
         return null;
       }
+      // Pre-validate every located trace with the board's own insertability predicate
+      // (check_polyline_trace -> check_trace_shape with contact pins) -- exactly what
+      // insert_forced_trace_polyline will enforce. This carries the pad-exit/tie-pin
+      // exemptions a plain clearance query cannot model, and a plan that fails it would
+      // otherwise be refused by the insert itself only after destructive shove attempts
+      // (measured: ~140 shove-insert failures per pass cost 58 s and left transient
+      // violations). A plan that passes inserts cleanly without shoving.
+      for (LocateFoundConnectionAlgo.ResultItem located_trace : located.connection_items) {
+        if (located_trace.corners == null || located_trace.corners.length < 2) {
+          continue;
+        }
+        boolean insertable;
+        try {
+          Polyline trace_polyline = new Polyline(located_trace.corners);
+          insertable = board.check_polyline_trace(trace_polyline, located_trace.layer,
+              p_ctrl.trace_half_width[located_trace.layer], new int[]{p_ctrl.net_no},
+              p_ctrl.trace_clearance_class_no);
+        } catch (Exception e) {
+          // Degenerate corner list -- not insertable as planned.
+          insertable = false;
+        }
+        if (!insertable) {
+          ++partition_drc_reject_count;
+          ++partition_fallback_count;
+          return null;
+        }
+      }
       AutorouteEngine commit_engine = new AutorouteEngine(board, tree, false);
       AutorouteEngine.ConnectionPlan plan = AutorouteEngine.ConnectionPlan.found(located, null);
-      // validate=true re-checks the located geometry against the LIVE tree, which is what makes
-      // partition staleness safe: a stale route simply fails here and the classic engine runs.
-      AutorouteAttemptResult result = commit_engine.commit_connection(plan, p_ctrl, no_ripped, true);
+      // The pre-check above makes insert failure rare; the snapshot is a safety net so a
+      // residual mid-chain insert failure cannot leave a partial connection on the board.
+      board.generate_snapshot();
+      AutorouteAttemptResult result = commit_engine.commit_connection(plan, p_ctrl, no_ripped, false);
       if (result.state != AutorouteAttemptState.ROUTED) {
+        board.undo(null);
         partition_router.invalidate();
         ++partition_fallback_count;
         return null;
       }
+      board.pop_snapshot();
       ++partition_routed_count;
       partition_router.invalidate();
       board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, p_ctrl.trace_costs,
@@ -817,9 +848,11 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       if (isPartitionRouterEnabled()) {
         job.logInfo("[partition-router] pass=" + p_pass_no + " routed=" + partition_routed_count
-            + " fallback=" + partition_fallback_count);
+            + " fallback=" + partition_fallback_count
+            + " drc_reject=" + partition_drc_reject_count);
         partition_routed_count = 0;
         partition_fallback_count = 0;
+        partition_drc_reject_count = 0;
       }
 
       // We are done with this pass
@@ -1825,6 +1858,15 @@ public class BatchAutorouter extends NamedAlgorithm {
     } catch (Exception e) {
       FRLogger.error("Error during routing passes", e);
       return new AutorouteAttemptResult(AutorouteAttemptState.FAILED);
+    } finally {
+      if (partition_router != null) {
+        // Every path through here may have mutated the board (classic engine commit, ripup,
+        // necked retry, pull-tight); a partition that misses freshly committed copper plans
+        // routes through occupied space and every later attempt fails the insertability
+        // check (measured: conflicts were dominated by high-id items inserted earlier in the
+        // same pass, and rejects cascaded to ~100%). The rebuild itself stays lazy.
+        partition_router.invalidate();
+      }
     }
   }
 

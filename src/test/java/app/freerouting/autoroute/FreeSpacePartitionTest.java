@@ -98,6 +98,48 @@ class FreeSpacePartitionTest {
     }
   }
 
+  /**
+   * The bulk path accumulates disjoint dirty ranges and rebuilds each on end_bulk; this drives
+   * it with the net-lift pattern (batched removes, search, batched re-inserts) plus scattered
+   * batched mutations, and requires equality with a from-scratch build after every batch.
+   */
+  @Test
+  void bulkMutationBatches_matchFreshBuild() {
+    Random rnd = new Random(7);
+    for (int round = 0; round < 5; round++) {
+      FreeSpacePartition partition = new FreeSpacePartition(BOUNDS);
+      java.util.Map<Integer, List<TileShape>> live = new java.util.HashMap<>();
+      for (int batch = 0; batch < 30; batch++) {
+        partition.begin_bulk();
+        int mutations = 1 + rnd.nextInt(8);
+        for (int m = 0; m < mutations; m++) {
+          if (!live.isEmpty() && rnd.nextInt(3) == 0) {
+            Integer victim = live.keySet().iterator().next();
+            live.remove(victim);
+            partition.remove(victim);
+          } else {
+            int id = rnd.nextInt(60);
+            List<TileShape> shapes = new ArrayList<>();
+            int shapeCount = 1 + rnd.nextInt(3);
+            for (int i = 0; i < shapeCount; i++) {
+              shapes.add(randomBox(rnd));
+            }
+            live.put(id, shapes);
+            partition.insert(id, shapes);
+          }
+        }
+        partition.end_bulk();
+        FreeSpacePartition fresh = new FreeSpacePartition(BOUNDS);
+        for (var entry : live.entrySet()) {
+          fresh.insert(entry.getKey(), entry.getValue());
+        }
+        assertEquals(canonical(fresh), canonical(partition),
+            "bulk-maintained partition diverged from a from-scratch build (round " + round
+                + ", batch " + batch + ")");
+      }
+    }
+  }
+
   private IntBox randomBox(Random rnd) {
     int x = rnd.nextInt(9000);
     int y = rnd.nextInt(9000);

@@ -1,6 +1,7 @@
 package app.freerouting.autoroute;
 
 import app.freerouting.board.Item;
+import app.freerouting.board.Pin;
 import app.freerouting.board.RoutingBoard;
 import app.freerouting.board.ShapeSearchTree;
 import app.freerouting.geometry.planar.IntBox;
@@ -246,9 +247,23 @@ public final class PartitionRouter {
         if (closed[neighbor.index]) {
           continue;
         }
-        if (border_length(cell.box, neighbor.box)
-            < 2 * (p_half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2) {
+        int min_pass = 2 * (p_half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
+        if (border_length(cell.box, neighbor.box) < min_pass) {
           continue; // the border cannot host a non-degenerate door section at this width
+        }
+        // Doors are vertical, so door length measures the trace's Y clearance -- but a cell
+        // NARROWER than the trace (thin gap between fine-pitch pads) additionally cannot host
+        // any vertical movement: a near-vertical segment is ~2*half_width wide in X and clips
+        // the obstacles bounding the cell on both sides (measured: the dominant reject cause,
+        // route-through-pin-row conflicts). Such a cell is traversable only STRAIGHT through:
+        // the entry door, the cell, and the exit door must share a Y-interval of trace width.
+        if (cell.box.ur.x - cell.box.ll.x < min_pass && came_from[current] >= 0) {
+          IntBox entry_box = cells.get(came_from[current]).box;
+          int shared_lo = Math.max(Math.max(entry_box.ll.y, neighbor.box.ll.y), cell.box.ll.y);
+          int shared_hi = Math.min(Math.min(entry_box.ur.y, neighbor.box.ur.y), cell.box.ur.y);
+          if (shared_hi - shared_lo < min_pass) {
+            continue;
+          }
         }
         double candidate = g[current] + center_distance(cell.box, neighbor.box);
         if (candidate < g[neighbor.index]) {
@@ -309,7 +324,10 @@ public final class PartitionRouter {
               continue;
             }
           }
-          result.putIfAbsent(cell, new ItemContact(item, i));
+          ItemContact previous = result.get(cell);
+          if (previous == null || (previous.item() instanceof Pin && !(item instanceof Pin))) {
+            result.put(cell, new ItemContact(item, i));
+          }
         }
       }
     }

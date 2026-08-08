@@ -94,9 +94,45 @@ It is not yet a win, for two measured reasons:
 2. **Attempt overhead**: lifting a partly-routed net spans most of the board, so each attempt
    pays a near-full-board rebuild even with bulk mutation (run: 43 s -> 75 s with the flag on).
 
-**Stage 3 — what would make it a win, in order:** model the pad-exit exemptions in the
-commit-time validator (or delegate terminal-segment legality to `check_trace_shape` with
-contact pins); replace the whole-net lift with a net-aware overlay so attempts stop paying
-board-scale rebuilds; then vias (`ExpansionDrill` chain elements). Gate protocol unchanged:
-three isolated runs, `--no-build-cache`, score ≥ 989.72, ≤ 2 unrouted, 0 violations, and
-wall-clock only after the gate.
+## Stage 3 — the systematic experiment series (all measured, most refuted)
+
+Every hypothesis below was implemented and A/B-measured on the reference workload
+(score gate ≥ 989.72 / ≤ 2 unrouted / 0 violations held in every run):
+
+1. **"The validator is too strict" — REFUTED.** A transactional commit (insert with
+   validation off, judge with the board's own `Item.clearance_violations()`, undo if dirty)
+   raised the hit rate 2 -> 12 but let ~140 attempts/pass die inside
+   `insert_forced_trace_polyline`, whose shove machinery churned the board (58 s pass 1,
+   transient violations). Replaced by pre-insert validation with `check_polyline_trace` —
+   the insert path's own predicate, with its pad-exit/tie-pin exemptions. Result: the same
+   ~140 rejects. The planned geometry is genuinely uninsertable; validation modeling was
+   never the wall.
+2. **"Pad-centre attachment causes the conflicts" — REFUTED.** Preferring (or forcing)
+   non-pad attachments — the escape vias/traces fanout already provides — changed nothing
+   (140 -> 144 rejects).
+3. **"Thin cells admit vertical movement wider than the cell" — marginal.** A straight-pass-only
+   constraint for cells narrower than the trace: 140 -> 135 rejects. Correct filter, kept,
+   not the wall.
+4. **Partition staleness — real but secondary.** Conflict logging showed rejects dominated
+   by high-id items committed earlier in the same pass by the CLASSIC engine, which never
+   invalidated the partition. Invalidating after every classic attempt (kept, for soundness)
+   cut rejects 140 -> 113 — but the hit rate stayed at 2, and per-attempt full rebuilds cost
+   98 s (fix would be observer-driven incremental updates, moot until the next point is solved).
+5. **The actual wall: slab strips break Locate's corner-realization contract.** With a fresh,
+   sound partition, rejected plans contain segments up to 340k units long crossing many
+   obstacles. `LocateFoundConnectionAlgo` shrinks each room by the compensated half-width
+   before placing interior corners; slab-strip cells in dense regions are about one trace
+   width wide, the shrunk interior is EMPTY, and corner placement degenerates — the realized
+   polyline leaves the cell chain entirely. Thin rooms are structurally unusable for the
+   unchanged Locate pipeline, independent of validation, attachment, or freshness.
+
+**Verdict.** The slab decomposition is proven cheap to maintain (disjoint bulk dirty-ranges
+brought flag-on overhead from +75% to ~+5%: 39.5 s vs 37.4 s baseline) and the
+partition -> Locate -> Insert bridge is proven sound — but this cell SHAPE cannot feed
+Locate at fine pitch. A future iteration needs a decomposition whose rooms guarantee a
+minimum interior width of 2x the compensated half-width plus margin — maximal-rectangle /
+corner-stitching covers (overlapping rooms are fine; the classic engine's own rooms overlap)
+— plus observer-driven incremental maintenance. Until then the flag stays default-off.
+
+Gate protocol unchanged: three isolated runs, `--no-build-cache`, score ≥ 989.72,
+≤ 2 unrouted, 0 violations, and wall-clock only after the gate.

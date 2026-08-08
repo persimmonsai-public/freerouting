@@ -7,6 +7,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.TreeSet;
 
 /**
@@ -94,37 +95,47 @@ public final class FreeSpacePartition {
   private List<Cell> cells;
   private Map<Cell, List<Cell>> adjacency;
   /**
-   * While a bulk mutation is open, {@link #insert}/{@link #remove} only accumulate the dirty
-   * x-range; {@link #end_bulk} performs one slab rebuild over the union. Lifting a routed
-   * net's items one at a time triggered a near-full rebuild per long trace, twice per search.
+   * While a bulk mutation is open, {@link #insert}/{@link #remove} only accumulate dirty
+   * x-ranges; {@link #end_bulk} rebuilds each disjoint range. The ranges are kept disjoint
+   * (from_x -> to_x, merged on overlap) rather than collapsed into one bounding range:
+   * lifting a routed net whose pads sit at opposite board edges must cost the slabs the net
+   * actually touches, not a whole-board rebuild.
    */
   private boolean bulk_open;
-  private int bulk_from_x;
-  private int bulk_to_x;
+  private final TreeMap<Integer, Integer> bulk_ranges = new TreeMap<>();
 
   /**
    * Starts accumulating mutations without rebuilding; must be paired with {@link #end_bulk}.
    */
   public void begin_bulk() {
     bulk_open = true;
-    bulk_from_x = bounds.ur.x;
-    bulk_to_x = bounds.ll.x;
+    bulk_ranges.clear();
   }
 
   /**
-   * Applies the accumulated dirty range in a single rebuild.
+   * Applies the accumulated dirty ranges, one rebuild per disjoint range.
    */
   public void end_bulk() {
     bulk_open = false;
-    if (bulk_from_x < bulk_to_x) {
-      rebuild_slab_range(clamp_x(bulk_from_x), clamp_x(bulk_to_x));
+    for (Map.Entry<Integer, Integer> range : bulk_ranges.entrySet()) {
+      rebuild_slab_range(clamp_x(range.getKey()), clamp_x(range.getValue()));
     }
+    bulk_ranges.clear();
   }
 
   private void mark_or_rebuild(int p_from_x, int p_to_x) {
     if (bulk_open) {
-      bulk_from_x = Math.min(bulk_from_x, p_from_x);
-      bulk_to_x = Math.max(bulk_to_x, p_to_x);
+      int from = p_from_x;
+      int to = p_to_x;
+      // absorb every stored range that overlaps [from, to]
+      Map.Entry<Integer, Integer> prev = bulk_ranges.floorEntry(to);
+      while (prev != null && prev.getValue() >= from) {
+        from = Math.min(from, prev.getKey());
+        to = Math.max(to, prev.getValue());
+        bulk_ranges.remove(prev.getKey());
+        prev = bulk_ranges.floorEntry(to);
+      }
+      bulk_ranges.put(from, to);
     } else {
       rebuild_slab_range(clamp_x(p_from_x), clamp_x(p_to_x));
     }
