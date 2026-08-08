@@ -140,6 +140,85 @@ class FreeSpacePartitionTest {
     }
   }
 
+  /**
+   * The room cover (overlapping horizontally-maximal rectangles): every room must be free of
+   * obstacles, every cell must be contained in at least one room (cover completeness), rooms
+   * must be horizontally maximal (extending one unit past either x-end hits an obstacle or the
+   * bounds), and adjacency must be symmetric with a real shared region.
+   */
+  @Test
+  void roomCover_isFree_complete_maximal_andSymmetric() {
+    Random rnd = new Random(99);
+    for (int round = 0; round < 5; round++) {
+      FreeSpacePartition partition = new FreeSpacePartition(BOUNDS);
+      java.util.Map<Integer, List<TileShape>> live = new java.util.HashMap<>();
+      for (int op = 0; op < 80; op++) {
+        if (!live.isEmpty() && rnd.nextInt(4) == 0) {
+          Integer victim = live.keySet().iterator().next();
+          live.remove(victim);
+          partition.remove(victim);
+        } else {
+          int id = rnd.nextInt(40);
+          List<TileShape> shapes = new ArrayList<>();
+          shapes.add(randomBox(rnd));
+          live.put(id, shapes);
+          partition.insert(id, shapes);
+        }
+      }
+      List<IntBox> obstacle_boxes = new ArrayList<>();
+      for (List<TileShape> shapes : live.values()) {
+        for (TileShape s : shapes) {
+          obstacle_boxes.add(s.bounding_box());
+        }
+      }
+      List<FreeSpacePartition.Room> rooms = partition.rooms();
+      for (FreeSpacePartition.Room room : rooms) {
+        for (IntBox ob : obstacle_boxes) {
+          boolean overlaps = room.box.ll.x < ob.ur.x && ob.ll.x < room.box.ur.x
+              && room.box.ll.y < ob.ur.y && ob.ll.y < room.box.ur.y;
+          assertTrue(!overlaps, "room " + boxString(room.box) + " overlaps obstacle " + boxString(ob));
+        }
+        // horizontal maximality: one unit past each x-end must hit an obstacle or the bounds
+        for (int side = 0; side < 2; side++) {
+          int probe_x = side == 0 ? room.box.ll.x - 1 : room.box.ur.x;
+          if (probe_x < BOUNDS.ll.x || probe_x >= BOUNDS.ur.x) {
+            continue; // at the bounds edge: maximal by definition
+          }
+          boolean blocked = false;
+          for (IntBox ob : obstacle_boxes) {
+            if (ob.ll.x <= probe_x && ob.ur.x > probe_x
+                && ob.ll.y < room.box.ur.y && room.box.ll.y < ob.ur.y) {
+              blocked = true;
+              break;
+            }
+          }
+          assertTrue(blocked, "room " + boxString(room.box)
+              + " is not horizontally maximal on side " + side);
+        }
+      }
+      for (FreeSpacePartition.Cell cell : partition.cells()) {
+        boolean covered = false;
+        for (FreeSpacePartition.Room room : rooms) {
+          if (room.box.ll.x <= cell.box.ll.x && room.box.ur.x >= cell.box.ur.x
+              && room.box.ll.y <= cell.box.ll.y && room.box.ur.y >= cell.box.ur.y) {
+            covered = true;
+            break;
+          }
+        }
+        assertTrue(covered, "cell " + boxString(cell.box) + " not contained in any room");
+      }
+      for (FreeSpacePartition.Room room : rooms) {
+        for (FreeSpacePartition.Room n : partition.room_neighbors(room)) {
+          assertTrue(partition.room_neighbors(n).contains(room), "room adjacency not symmetric");
+          int dx = Math.min(room.box.ur.x, n.box.ur.x) - Math.max(room.box.ll.x, n.box.ll.x);
+          int dy = Math.min(room.box.ur.y, n.box.ur.y) - Math.max(room.box.ll.y, n.box.ll.y);
+          assertTrue(dx >= 0 && dy >= 0 && (dx > 0 || dy > 0),
+              "room neighbors share no region: " + boxString(room.box) + " / " + boxString(n.box));
+        }
+      }
+    }
+  }
+
   private IntBox randomBox(Random rnd) {
     int x = rnd.nextInt(9000);
     int y = rnd.nextInt(9000);

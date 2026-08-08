@@ -277,6 +277,8 @@ public final class FreeSpacePartition {
   private void rebuild_slab_range(int p_from_x, int p_to_x) {
     cells = null;
     adjacency = null;
+    rooms = null;
+    room_adjacency = null;
     // One slab wider on both sides than [p_from_x, p_to_x): a newly added edge can SPLIT a
     // pre-existing slab, leaving the portion before p_from_x with a stale entry keyed by the
     // old left edge, and the portion at/after p_to_x with no entry at all. (Found by the
@@ -398,6 +400,127 @@ public final class FreeSpacePartition {
         }
       }
     }
+  }
+
+  /**
+   * A horizontally-maximal free rectangle: a merged cell extended left and right through every
+   * slab whose free interval CONTAINS the cell's y-interval (the cell merge requires equality).
+   * Rooms overlap each other and form a COVER of the free space, not a partition.
+   *
+   * <p>Why they exist: the disjoint slab cells are about one trace width wide in dense
+   * regions, and {@code LocateFoundConnectionAlgo} erodes each room by the compensated trace
+   * half-width before placing interior corners -- on a thin cell the eroded interior is empty
+   * and corner placement degenerates (measured: realized polylines left the cell chain
+   * entirely). Maximal rectangles give the erosion real interior to work with.
+   */
+  public static final class Room {
+    public final IntBox box;
+    /** Position in {@link #rooms()}, stable until the next mutation. */
+    public int index;
+
+    Room(IntBox p_box) {
+      this.box = p_box;
+    }
+  }
+
+  private List<Room> rooms;
+  private Map<Room, List<Room>> room_adjacency;
+
+  /**
+   * The current room cover, rebuilt on demand after mutations; must not be mutated.
+   */
+  public List<Room> rooms() {
+    if (rooms == null) {
+      build_rooms();
+    }
+    return rooms;
+  }
+
+  /**
+   * The rooms whose rectangles intersect p_region (touching edges do not count).
+   */
+  public List<Room> rooms_intersecting(IntBox p_region) {
+    List<Room> result = new ArrayList<>();
+    for (Room r : rooms()) {
+      if (r.box.ll.x < p_region.ur.x && p_region.ll.x < r.box.ur.x
+          && r.box.ll.y < p_region.ur.y && p_region.ll.y < r.box.ur.y) {
+        result.add(r);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * The rooms whose rectangles intersect p_room's with positive extent in at least one
+   * dimension (2-dimensional overlap, or a shared border segment; corner-point touches are
+   * excluded).
+   */
+  public List<Room> room_neighbors(Room p_room) {
+    if (room_adjacency == null) {
+      build_rooms();
+    }
+    List<Room> result = room_adjacency.get(p_room);
+    return result == null ? List.of() : result;
+  }
+
+  private void build_rooms() {
+    rooms = new ArrayList<>();
+    room_adjacency = new HashMap<>();
+    java.util.Set<String> seen = new java.util.HashSet<>();
+    for (Cell c : cells()) {
+      int lo = c.box.ll.y;
+      int hi = c.box.ur.y;
+      int left = c.box.ll.x;
+      while (left > bounds.ll.x) {
+        Integer prev = slab_edges.lower(left);
+        if (prev == null || !interval_contained(prev, lo, hi)) {
+          break;
+        }
+        left = prev;
+      }
+      int right = c.box.ur.x;
+      while (right < bounds.ur.x && interval_contained(right, lo, hi)) {
+        Integer next = slab_edges.higher(right);
+        if (next == null) {
+          break;
+        }
+        right = next;
+      }
+      if (seen.add(left + ":" + right + ":" + lo + ":" + hi)) {
+        Room room = new Room(new IntBox(left, lo, right, hi));
+        room.index = rooms.size();
+        rooms.add(room);
+      }
+    }
+    for (int i = 0; i < rooms.size(); i++) {
+      for (int j = i + 1; j < rooms.size(); j++) {
+        IntBox a = rooms.get(i).box;
+        IntBox b = rooms.get(j).box;
+        int dx = Math.min(a.ur.x, b.ur.x) - Math.max(a.ll.x, b.ll.x);
+        int dy = Math.min(a.ur.y, b.ur.y) - Math.max(a.ll.y, b.ll.y);
+        if (dx >= 0 && dy >= 0 && (dx > 0 || dy > 0)) {
+          room_adjacency.computeIfAbsent(rooms.get(i), k -> new ArrayList<>()).add(rooms.get(j));
+          room_adjacency.computeIfAbsent(rooms.get(j), k -> new ArrayList<>()).add(rooms.get(i));
+        }
+      }
+    }
+  }
+
+  /**
+   * Whether the slab whose left edge is p_slab_left has a free interval containing
+   * [p_lo, p_hi].
+   */
+  private boolean interval_contained(int p_slab_left, int p_lo, int p_hi) {
+    List<int[]> intervals = free_intervals.get(p_slab_left);
+    if (intervals == null) {
+      return false;
+    }
+    for (int[] iv : intervals) {
+      if (iv[0] <= p_lo && iv[1] >= p_hi) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private void finalize_open(Map<Long, int[]> p_open, int p_end_x,

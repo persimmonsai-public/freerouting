@@ -129,10 +129,37 @@ Every hypothesis below was implemented and A/B-measured on the reference workloa
 **Verdict.** The slab decomposition is proven cheap to maintain (disjoint bulk dirty-ranges
 brought flag-on overhead from +75% to ~+5%: 39.5 s vs 37.4 s baseline) and the
 partition -> Locate -> Insert bridge is proven sound — but this cell SHAPE cannot feed
-Locate at fine pitch. A future iteration needs a decomposition whose rooms guarantee a
-minimum interior width of 2x the compensated half-width plus margin — maximal-rectangle /
-corner-stitching covers (overlapping rooms are fine; the classic engine's own rooms overlap)
-— plus observer-driven incremental maintenance. Until then the flag stays default-off.
+Locate at fine pitch. That prediction was then tested directly:
+
+## Stage 3b — maximal-rectangle room cover (measured: direction confirmed, not yet a win)
+
+`FreeSpacePartition` now derives a **room cover** from the cells: each merged cell extended
+left/right through every slab whose free interval CONTAINS its y-interval. Rooms are
+overlapping maximal rectangles (a cover, not a partition); doors between overlapping rooms
+are 2-dimensional, which `ExpansionDoor` already supports between
+`CompleteFreeSpaceExpansionRoom`s. The A* runs over rooms with two admissions: an
+intermediate room must be wider than the trace in BOTH dimensions (so Locate's erosion has
+interior), and a transition's overlap must host the trace width along its long dimension.
+Property-tested: rooms free of obstacles, cover complete, horizontally maximal, adjacency
+symmetric.
+
+Measured (same fixture, flag on, partition invalidated after every attempt for soundness):
+
+- pass-1 hit rate 1 -> **7** routed, rejects 113 -> 94, zero violations in every pass —
+  fat rooms demonstrably fix the Locate degeneration for the routes that now commit;
+- **not gate-green**: final 984.59 / 3 unrouted (gate: >= 989.72 / <= 2) — the partition
+  routes that do commit are low-quality serpentines that cost endgame score;
+- **4x runtime** (148 s vs 37.4 s baseline): per-attempt wholesale freshness costs
+  ~150 ms even after bulk-building (`ensure_fresh` now uses begin/end_bulk; a from-scratch
+  build without bulk was measured at ~240 ms/attempt, +47 s per pass).
+
+Remaining, in value order: (1) observer-driven incremental maintenance instead of
+per-attempt wholesale rebuilds; (2) terminal-room handling — Locate also erodes the
+start/target rooms, and the A*-side exemption does not help Locate itself, which likely
+drives most of the residual 94 rejects (fine-pitch exits again, now at the ends only);
+(3) path-cost shaping so partition routes stop being serpentines (cost on door-crossing
+turns, not just center distance). The flag stays default-off; flag-off behavior is
+unchanged.
 
 Gate protocol unchanged: three isolated runs, `--no-build-cache`, score ≥ 989.72,
 ≤ 2 unrouted, 0 violations, and wall-clock only after the gate.

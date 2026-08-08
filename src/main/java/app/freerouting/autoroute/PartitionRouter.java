@@ -34,21 +34,21 @@ import java.util.Set;
 public final class PartitionRouter {
 
   /**
-   * A found single-layer route: the cell sequence to realize, plus the item shapes it attaches
-   * to at both ends.
+   * A found single-layer route: the room sequence to realize (overlapping maximal rectangles
+   * from the partition's room cover), plus the item shapes it attaches to at both ends.
    */
   public static final class CellRoute {
     public final int layer;
-    public final List<FreeSpacePartition.Cell> cells;
+    public final List<FreeSpacePartition.Room> rooms;
     public final Item start_item;
     public final int start_tree_entry_no;
     public final Item target_item;
     public final int target_tree_entry_no;
 
-    CellRoute(int p_layer, List<FreeSpacePartition.Cell> p_cells, Item p_start_item,
+    CellRoute(int p_layer, List<FreeSpacePartition.Room> p_rooms, Item p_start_item,
         int p_start_entry, Item p_target_item, int p_target_entry) {
       this.layer = p_layer;
-      this.cells = p_cells;
+      this.rooms = p_rooms;
       this.start_item = p_start_item;
       this.start_tree_entry_no = p_start_entry;
       this.target_item = p_target_item;
@@ -90,6 +90,10 @@ public final class PartitionRouter {
         continue;
       }
       FreeSpacePartition partition = new FreeSpacePartition(bounds);
+      // Bulk mode: without it every single insert pays an immediate local slab rebuild and a
+      // from-scratch build costs ~240 ms instead of the ~21 ms measured for one bulk rebuild
+      // (observed as +47 s over a pass once the partition was invalidated per attempt).
+      partition.begin_bulk();
       for (Item item : board.get_items()) {
         int shape_count = item.tree_shape_count(tree);
         List<TileShape> shapes = null;
@@ -110,6 +114,7 @@ public final class PartitionRouter {
           partition.insert(item.get_id_no(), shapes);
         }
       }
+      partition.end_bulk();
       partitions[layer] = partition;
     }
     dirty = false;
@@ -200,8 +205,8 @@ public final class PartitionRouter {
 
   private static double route_length(CellRoute p_route) {
     double result = 0;
-    for (int i = 0; i + 1 < p_route.cells.size(); i++) {
-      result += center_distance(p_route.cells.get(i).box, p_route.cells.get(i + 1).box);
+    for (int i = 0; i + 1 < p_route.rooms.size(); i++) {
+      result += center_distance(p_route.rooms.get(i).box, p_route.rooms.get(i + 1).box);
     }
     return result;
   }
@@ -209,63 +214,64 @@ public final class PartitionRouter {
   private CellRoute try_route_on_layer(int p_layer, Set<Item> p_start_set, Set<Item> p_dest_set,
       int p_half_width) {
     FreeSpacePartition partition = partitions[p_layer];
-    // Cells abutting an item shape, with the shape's tree entry number for door construction.
-    Map<FreeSpacePartition.Cell, ItemContact> starts = contact_cells(partition, p_start_set, p_layer, p_half_width, false);
+    // Rooms abutting an item shape, with the shape's tree entry number for door construction.
+    Map<FreeSpacePartition.Room, ItemContact> starts = contact_rooms(partition, p_start_set, p_layer, p_half_width, false);
     if (starts.isEmpty()) {
       return null;
     }
-    Map<FreeSpacePartition.Cell, ItemContact> targets = contact_cells(partition, p_dest_set, p_layer, p_half_width, true);
+    Map<FreeSpacePartition.Room, ItemContact> targets = contact_rooms(partition, p_dest_set, p_layer, p_half_width, true);
     if (targets.isEmpty()) {
       return null;
     }
 
-    // A* over cells: g = accumulated center distance, h = distance to the nearest target box.
-    List<FreeSpacePartition.Cell> cells = partition.cells();
-    double[] g = new double[cells.size()];
-    int[] came_from = new int[cells.size()];
+    // A* over the room cover: g = accumulated center distance, h = distance to the nearest
+    // target box. Rooms are overlapping maximal rectangles, so admission is about interiors
+    // and overlaps rather than shared borders:
+    //  - an INTERMEDIATE room must be wide enough in both dimensions for Locate's erosion by
+    //    the compensated half width to leave interior (thin rooms measured to degenerate
+    //    corner placement); start/target rooms are exempt because attachment there is handled
+    //    by the item connection shapes, not by erosion;
+    //  - a transition is passable when the overlap region's LONG dimension hosts the trace
+    //    width (the trace crosses perpendicular to the overlap's thin dimension).
+    int min_pass = 2 * (p_half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
+    List<FreeSpacePartition.Room> rooms = partition.rooms();
+    double[] g = new double[rooms.size()];
+    int[] came_from = new int[rooms.size()];
     java.util.Arrays.fill(g, Double.MAX_VALUE);
     java.util.Arrays.fill(came_from, -1);
     PriorityQueue<double[]> open = new PriorityQueue<>((a, b) -> Double.compare(a[0], b[0]));
-    for (FreeSpacePartition.Cell start : starts.keySet()) {
+    for (FreeSpacePartition.Room start : starts.keySet()) {
       g[start.index] = 0;
       open.add(new double[]{heuristic(start, targets.keySet()), start.index});
     }
-    FreeSpacePartition.Cell reached = null;
-    boolean[] closed = new boolean[cells.size()];
+    FreeSpacePartition.Room reached = null;
+    boolean[] closed = new boolean[rooms.size()];
     while (!open.isEmpty()) {
       int current = (int) open.poll()[1];
       if (closed[current]) {
         continue;
       }
       closed[current] = true;
-      FreeSpacePartition.Cell cell = cells.get(current);
-      if (targets.containsKey(cell)) {
-        reached = cell;
+      FreeSpacePartition.Room room = rooms.get(current);
+      if (targets.containsKey(room)) {
+        reached = room;
         break;
       }
-      for (FreeSpacePartition.Cell neighbor : partition.neighbors(cell)) {
+      for (FreeSpacePartition.Room neighbor : partition.room_neighbors(room)) {
         if (closed[neighbor.index]) {
           continue;
         }
-        int min_pass = 2 * (p_half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
-        if (border_length(cell.box, neighbor.box) < min_pass) {
-          continue; // the border cannot host a non-degenerate door section at this width
+        if (!targets.containsKey(neighbor) && !starts.containsKey(neighbor)
+            && (neighbor.box.ur.x - neighbor.box.ll.x < min_pass
+                || neighbor.box.ur.y - neighbor.box.ll.y < min_pass)) {
+          continue; // too thin for Locate's interior erosion
         }
-        // Doors are vertical, so door length measures the trace's Y clearance -- but a cell
-        // NARROWER than the trace (thin gap between fine-pitch pads) additionally cannot host
-        // any vertical movement: a near-vertical segment is ~2*half_width wide in X and clips
-        // the obstacles bounding the cell on both sides (measured: the dominant reject cause,
-        // route-through-pin-row conflicts). Such a cell is traversable only STRAIGHT through:
-        // the entry door, the cell, and the exit door must share a Y-interval of trace width.
-        if (cell.box.ur.x - cell.box.ll.x < min_pass && came_from[current] >= 0) {
-          IntBox entry_box = cells.get(came_from[current]).box;
-          int shared_lo = Math.max(Math.max(entry_box.ll.y, neighbor.box.ll.y), cell.box.ll.y);
-          int shared_hi = Math.min(Math.min(entry_box.ur.y, neighbor.box.ur.y), cell.box.ur.y);
-          if (shared_hi - shared_lo < min_pass) {
-            continue;
-          }
+        int dx = Math.min(room.box.ur.x, neighbor.box.ur.x) - Math.max(room.box.ll.x, neighbor.box.ll.x);
+        int dy = Math.min(room.box.ur.y, neighbor.box.ur.y) - Math.max(room.box.ll.y, neighbor.box.ll.y);
+        if (Math.max(dx, dy) < min_pass) {
+          continue; // the overlap cannot host a trace-wide crossing
         }
-        double candidate = g[current] + center_distance(cell.box, neighbor.box);
+        double candidate = g[current] + center_distance(room.box, neighbor.box);
         if (candidate < g[neighbor.index]) {
           g[neighbor.index] = candidate;
           came_from[neighbor.index] = current;
@@ -276,9 +282,9 @@ public final class PartitionRouter {
     if (reached == null) {
       return null;
     }
-    List<FreeSpacePartition.Cell> path = new ArrayList<>();
+    List<FreeSpacePartition.Room> path = new ArrayList<>();
     for (int at = reached.index; at != -1; at = came_from[at]) {
-      path.add(0, cells.get(at));
+      path.add(0, rooms.get(at));
     }
     ItemContact start_contact = starts.get(path.get(0));
     ItemContact target_contact = targets.get(reached);
@@ -290,12 +296,12 @@ public final class PartitionRouter {
   }
 
   /**
-   * Cells that touch (within p_touch_margin) a shape of any of the items on the layer, mapped
+   * Rooms that touch (within p_touch_margin) a shape of any of the items on the layer, mapped
    * to that item and shape index.
    */
-  private Map<FreeSpacePartition.Cell, ItemContact> contact_cells(FreeSpacePartition p_partition,
+  private Map<FreeSpacePartition.Room, ItemContact> contact_rooms(FreeSpacePartition p_partition,
       Set<Item> p_items, int p_layer, int p_touch_margin, boolean p_require_connection_shape) {
-    Map<FreeSpacePartition.Cell, ItemContact> result = new HashMap<>();
+    Map<FreeSpacePartition.Room, ItemContact> result = new HashMap<>();
     for (Item item : p_items) {
       int shape_count = item.tree_shape_count(tree);
       for (int i = 0; i < shape_count; i++) {
@@ -307,11 +313,11 @@ public final class PartitionRouter {
           continue;
         }
         IntBox probe = shape.bounding_box().offset(p_touch_margin);
-        for (FreeSpacePartition.Cell cell : p_partition.cells_intersecting(probe)) {
+        for (FreeSpacePartition.Room room : p_partition.rooms_intersecting(probe)) {
           // The bounding-box probe over-selects around diagonal shapes; the door built later
-          // needs the ACTUAL shape to intersect the cell (abutting closed regions share their
+          // needs the ACTUAL shape to intersect the room (abutting closed regions share their
           // border segment, which is enough).
-          if (shape.intersection(cell.box).is_empty()) {
+          if (shape.intersection(room.box).is_empty()) {
             continue;
           }
           if (p_require_connection_shape) {
@@ -320,13 +326,13 @@ public final class PartitionRouter {
             // is unusable as a target.
             TileShape connection = ((app.freerouting.board.Connectable) item)
                 .get_trace_connection_shape(tree, i);
-            if (connection == null || connection.intersection(cell.box).is_empty()) {
+            if (connection == null || connection.intersection(room.box).is_empty()) {
               continue;
             }
           }
-          ItemContact previous = result.get(cell);
+          ItemContact previous = result.get(room);
           if (previous == null || (previous.item() instanceof Pin && !(item instanceof Pin))) {
-            result.put(cell, new ItemContact(item, i));
+            result.put(room, new ItemContact(item, i));
           }
         }
       }
@@ -359,7 +365,7 @@ public final class PartitionRouter {
   public MazeSearchAlgo.Result materialize(CellRoute p_route, AutorouteControl p_ctrl) {
     int layer = p_route.layer;
     int half_width = p_ctrl.compensated_trace_half_width[layer];
-    List<FreeSpacePartition.Cell> path = p_route.cells;
+    List<FreeSpacePartition.Room> path = p_route.rooms;
 
     List<CompleteFreeSpaceExpansionRoom> rooms = new ArrayList<>(path.size());
     for (int i = 0; i < path.size(); i++) {
@@ -435,19 +441,12 @@ public final class PartitionRouter {
     return new MazeSearchAlgo.Result(target_door, 0);
   }
 
-  private static double heuristic(FreeSpacePartition.Cell p_cell, Set<FreeSpacePartition.Cell> p_targets) {
+  private static double heuristic(FreeSpacePartition.Room p_room, Set<FreeSpacePartition.Room> p_targets) {
     double best = Double.MAX_VALUE;
-    for (FreeSpacePartition.Cell target : p_targets) {
-      best = Math.min(best, box_distance(p_cell.box, target.box));
+    for (FreeSpacePartition.Room target : p_targets) {
+      best = Math.min(best, box_distance(p_room.box, target.box));
     }
     return best;
-  }
-
-  /**
-   * Length of the shared vertical border between two horizontally adjacent boxes.
-   */
-  private static int border_length(IntBox p_a, IntBox p_b) {
-    return Math.min(p_a.ur.y, p_b.ur.y) - Math.max(p_a.ll.y, p_b.ll.y);
   }
 
   private static double center_distance(IntBox p_a, IntBox p_b) {
