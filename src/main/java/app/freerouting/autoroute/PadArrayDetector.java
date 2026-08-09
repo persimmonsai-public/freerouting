@@ -48,6 +48,68 @@ public final class PadArrayDetector {
 
   private final Map<Integer, PadEscape> escape_by_pin_id = new HashMap<>();
 
+  /**
+   * Whether a legal via position exists within dogbone reach of p_pin -- the production form
+   * of the feasibility spot scan, with the semantics that three measured corrections
+   * established: the SMALLEST available via governs, only the via's SPAN layers are checked,
+   * and non-obstacle conduction areas (copper pours, which reflow) are passable. Items whose
+   * ids are in p_ignore_ids (e.g. a planner's own tentative placements) are also passable.
+   *
+   * @param p_reach   how far from the pad centre to scan (e.g. 1.5x pitch)
+   * @param p_step    scan grid step (e.g. pitch / 6)
+   */
+  public static boolean escape_spot_exists(RoutingBoard p_board, Pin p_pin, int p_reach,
+      int p_step, java.util.Set<Integer> p_ignore_ids) {
+    int via_radius = Integer.MAX_VALUE;
+    int from_layer = 0;
+    int to_layer = p_board.get_layer_count() - 1;
+    for (int v = 0; v < p_board.rules.via_infos.count(); v++) {
+      var padstack = p_board.rules.via_infos.get(v).get_padstack();
+      IntBox via_box = padstack.get_shape(padstack.from_layer()).bounding_box();
+      int radius = (via_box.ur.x - via_box.ll.x) / 2;
+      if (radius < via_radius) {
+        via_radius = radius;
+        from_layer = padstack.from_layer();
+        to_layer = padstack.to_layer();
+      }
+    }
+    if (via_radius == Integer.MAX_VALUE) {
+      return false;
+    }
+    var tree = p_board.search_tree_manager.get_default_tree();
+    FloatPoint center = p_pin.get_center().to_float();
+    for (int dx = -p_reach; dx <= p_reach; dx += p_step) {
+      for (int dy = -p_reach; dy <= p_reach; dy += p_step) {
+        if (dx == 0 && dy == 0) {
+          continue;
+        }
+        int cx = (int) center.x + dx;
+        int cy = (int) center.y + dy;
+        IntBox via_box = new IntBox(cx - via_radius, cy - via_radius, cx + via_radius, cy + via_radius);
+        boolean legal = true;
+        for (int layer = from_layer; layer <= to_layer && legal; layer++) {
+          for (var entry : tree.overlapping_tree_entries_with_clearance(via_box, layer, new int[0], 1)) {
+            if (!(entry.object instanceof Item blocking) || blocking.shares_net(p_pin)) {
+              continue;
+            }
+            if (blocking instanceof app.freerouting.board.ConductionArea pour && !pour.get_is_obstacle()) {
+              continue;
+            }
+            if (p_ignore_ids != null && p_ignore_ids.contains(blocking.get_id_no())) {
+              continue;
+            }
+            legal = false;
+            break;
+          }
+        }
+        if (legal) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   public PadArrayDetector(RoutingBoard p_board) {
     Map<Integer, List<Pin>> pins_by_component = new HashMap<>();
     for (Item item : p_board.get_items()) {
