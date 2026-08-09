@@ -120,6 +120,17 @@ class ArrayPadFieldProbeTest {
       raw_violations += item.clearance_violation_count();
     }
     System.out.println("[pad-array] raw_board_violation_count=" + raw_violations);
+    // Escape-failure map: SMD pins with a net but no contacts after the fanout stage,
+    // grouped by component -- tells Phase 1 exactly where escapes fail.
+    Map<String, Integer> unescaped_by_component = new java.util.TreeMap<>();
+    for (Item item : board.get_items()) {
+      if (item instanceof Pin pin && pin.first_layer() == pin.last_layer()
+          && pin.net_count() > 0 && pin.get_normal_contacts().isEmpty()) {
+        String comp = board.components.get(pin.get_component_no()).name;
+        unescaped_by_component.merge(comp, 1, Integer::sum);
+      }
+    }
+    System.out.println("[pad-array] unescaped_smd_by_component=" + unescaped_by_component);
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width
