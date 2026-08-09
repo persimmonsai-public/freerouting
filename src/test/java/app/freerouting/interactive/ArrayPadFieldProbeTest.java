@@ -71,6 +71,17 @@ class ArrayPadFieldProbeTest {
       }
     }
 
+    java.util.Set<Integer> unescaped_ids = new java.util.HashSet<>();
+    for (Item item : board.get_items()) {
+      if (item instanceof Pin pin && pin.first_layer() == pin.last_layer()
+          && pin.net_count() > 0 && pin.get_normal_contacts().isEmpty()) {
+        unescaped_ids.add(pin.get_id_no());
+      }
+    }
+    var via_padstack = board.rules.via_infos.get(0).get_padstack();
+    IntBox via_shape = via_padstack.get_shape(via_padstack.from_layer()).bounding_box();
+    int via_radius = (via_shape.ur.x - via_shape.ll.x) / 2;
+    int clearance = board.rules.clearance_matrix.get_value(1, 1, 0, false);
     for (Map.Entry<Integer, List<Pin>> entry : pins_by_component.entrySet()) {
       List<Pin> pins = entry.getValue();
       if (pins.size() < 8) {
@@ -111,6 +122,39 @@ class ArrayPadFieldProbeTest {
           + " regularity=(" + String.format("%.2f", regularity_x) + "," + String.format("%.2f", regularity_y) + ")"
           + " pad=" + (pad_box.ur.x - pad_box.ll.x) + "x" + (pad_box.ur.y - pad_box.ll.y)
           + (smd ? " SMD layer=" + sample.first_layer() : " TH"));
+      // Escape-feasibility classification of this component's unescaped pins:
+      // interior grid balls can only host a via at the grid diagonal; boundary balls can
+      // always dogbone outward into open space (-> algorithm-missed if unescaped).
+      int rules_impossible = 0;
+      int algorithm_missed = 0;
+      double diagonal_reach = Math.hypot(pitch_x, pitch_y) / 2;
+      double x_lo = xs.isEmpty() ? 0 : xs.get(0);
+      double x_hi = xs.isEmpty() ? 0 : xs.get(xs.size() - 1);
+      double y_lo = ys.isEmpty() ? 0 : ys.get(0);
+      double y_hi = ys.isEmpty() ? 0 : ys.get(ys.size() - 1);
+      for (Pin pin : pins) {
+        if (!unescaped_ids.contains(pin.get_id_no())) {
+          continue;
+        }
+        FloatPoint c = pin.get_center().to_float();
+        double tol = Math.max(1, Math.min(pitch_x, pitch_y) / 4);
+        boolean interior = c.x > x_lo + tol && c.x < x_hi - tol && c.y > y_lo + tol && c.y < y_hi - tol;
+        IntBox own_pad = pin.get_tile_shape_on_layer(pin.first_layer()).bounding_box();
+        int pad_half = Math.min(own_pad.ur.x - own_pad.ll.x, own_pad.ur.y - own_pad.ll.y) / 2;
+        double required = via_radius + clearance + pad_half;
+        if (interior && diagonal_reach < required) {
+          ++rules_impossible;
+        } else {
+          ++algorithm_missed;
+        }
+      }
+      if (rules_impossible + algorithm_missed > 0) {
+        System.out.println("[pad-array] escape-feasibility component=" + name
+            + " rules_impossible=" + rules_impossible
+            + " algorithm_missed=" + algorithm_missed
+            + " (diagonal_reach=" + Math.round(diagonal_reach)
+            + " vs required=via_r+clr+pad_half)");
+      }
     }
 
     // Violations already present on the (nearly) unrouted board: constant late-pass
