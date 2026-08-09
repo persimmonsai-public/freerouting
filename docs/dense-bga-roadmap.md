@@ -184,3 +184,13 @@ semantics honored the accounting inverts:
 Consequences: items 1-2 have real targets on BOTH fixtures; the feasibility classifier must
 use is-obstacle semantics (pours passable, spans respected) when it graduates to
 production; and the fanout stage has ~34 diagnosable misses on the original board.
+
+## Microvia variant: full-routing measurement (2026-08-09)
+
+Same 20-minute budget as the baseline: the variant reaches pass 5 at **461.84 / 56
+unrouted / 538 (pre-existing) violations** vs the original's 451.97 / 59 -- the existing
+engine exploits the blind microvia end-to-end with no code changes (+3 routed, +10 score).
+Against the 55/55 geometrically-achievable escapes, 56 unrouted confirms the remaining gap
+is planning and negotiation, not via availability: the Phase-2 escape planner (capacity
+model, ring-to-layer assignment, fixed pre-routes) and Phase-3 negotiation are the levers,
+with the ~34 diagnosable fanout misses the immediate code target.
