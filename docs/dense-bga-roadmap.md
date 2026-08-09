@@ -134,3 +134,16 @@ Consequences, in order:
    via set -- then U1 inner-ball escape becomes legal and the machinery is measurable.
 3. Region-scoped rules remain valuable for trace necking between balls (2500-unit traces in
    4000-5000-unit gaps is workable) independent of the via problem.
+
+## U1 investigation complete (measured 2026-08-09)
+
+The candidate-spot legality scan (8000 via + clearance vs the tree, all 8 layers, 1500-step
+grid within 13.5k reach) found ZERO legal via positions for the two "algorithm-missed"
+boundary balls (pins 188/189) -- on the post-fanout AND the pre-fanout board (fixed items
+crowd that region; fanout ordering is not the cause). Verdict: **all 9 unescaped U1 balls
+are rules-impossible under the design's single 8000-unit through-hole via; the fanout stage
+makes zero errors on the BGA.** The v1 classifier's boundary assumption over-counted, as
+flagged; the spatial scan is the correct feasibility test and should replace it when the
+classifier graduates to production. Achievable-escape work therefore moves to U5/U2/U6
+(spatial scan as the tool), and exercising Phase-1 span machinery still requires the
+microvia fixture variant.

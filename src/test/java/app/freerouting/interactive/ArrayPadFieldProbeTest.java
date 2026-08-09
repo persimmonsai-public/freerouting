@@ -190,6 +190,54 @@ class ArrayPadFieldProbeTest {
           + " attach_smd=" + info.attach_smd_allowed());
     }
     System.out.println("[pad-array] default_clearance=" + board.rules.clearance_matrix.get_value(1, 1, 0, false));
+    // Candidate-spot legality scan for the two algorithm-missed U1 balls: does ANY legal
+    // via position exist within dogbone reach? Binary outcome: fanout bug vs rules-impossible.
+    var scan_tree = board.search_tree_manager.get_default_tree();
+    for (Item item : board.get_items()) {
+      if (!(item instanceof Pin pin) || (pin.get_id_no() != 188 && pin.get_id_no() != 189)) {
+        continue;
+      }
+      FloatPoint c = pin.get_center().to_float();
+      int legal_spots = 0;
+      int legal_spots_pre = 0;
+      double nearest = Double.MAX_VALUE;
+      for (int dx = -13500; dx <= 13500; dx += 1500) {
+        for (int dy = -13500; dy <= 13500; dy += 1500) {
+          if (dx == 0 && dy == 0) {
+            continue;
+          }
+          int cx = (int) c.x + dx;
+          int cy = (int) c.y + dy;
+          IntBox via_box = new IntBox(cx - via_radius, cy - via_radius, cx + via_radius, cy + via_radius);
+          boolean legal_post = true;
+          boolean legal_pre = true; // ignoring fanout-added traces/vias: the pre-fanout board
+          for (int layer = 0; layer < board.get_layer_count() && legal_pre; layer++) {
+            for (var entry : scan_tree.overlapping_tree_entries_with_clearance(
+                via_box, layer, new int[0], 1)) {
+              if (entry.object instanceof Item blocking && !blocking.shares_net(pin)) {
+                legal_post = false;
+                if (!(blocking instanceof app.freerouting.board.Trace)
+                    && !(blocking instanceof app.freerouting.board.Via)) {
+                  legal_pre = false;
+                  break;
+                }
+              }
+            }
+          }
+          if (legal_post) {
+            ++legal_spots;
+            nearest = Math.min(nearest, Math.hypot(dx, dy));
+          }
+          if (legal_pre) {
+            ++legal_spots_pre;
+          }
+        }
+      }
+      System.out.println("[pad-array] spot-scan pin=" + pin.get_id_no()
+          + " legal_spots_post_fanout=" + legal_spots
+          + " legal_spots_pre_fanout=" + legal_spots_pre
+          + " nearest=" + (legal_spots == 0 ? "none" : String.valueOf(Math.round(nearest))));
+    }
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width
