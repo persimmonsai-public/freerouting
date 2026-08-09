@@ -194,3 +194,16 @@ Against the 55/55 geometrically-achievable escapes, 56 unrouted confirms the rem
 is planning and negotiation, not via availability: the Phase-2 escape planner (capacity
 model, ring-to-layer assignment, fixed pre-routes) and Phase-3 negotiation are the levers,
 with the ~34 diagnosable fanout misses the immediate code target.
+
+## Span-preference measurement closes item 2's engine question (2026-08-09)
+
+Via-rule ORDER is the engine's span selector, A/B'd on the variant in the same budget:
+microvia listed FIRST scores 451.97/59 (equal to no microvia -- preferring a blind 0-1 via
+everywhere wastes placements that cannot reach deeper layers); microvia listed as FALLBACK
+scores 461.84/56. Ordered-fallback (largest-span first, microvias rescuing tight spots) is
+the effective span mechanism with zero engine changes, and the variant fixture now encodes
+it. True cost-based span selection inside MazeSearchAlgo's via-mask loop remains future
+work relevant only to richer via sets. Remaining gap (56 unrouted vs 55 achievable escapes)
+is Phase-2 planning + Phase-3 negotiation; fanout "misses" were re-diagnosed as full-route
+failures (fanout = autoroute_connection to the nearest net target, not bare via placement),
+so they are the same routing problem, not a separate via-placement defect.
