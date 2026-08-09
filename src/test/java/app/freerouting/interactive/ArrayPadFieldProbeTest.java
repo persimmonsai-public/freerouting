@@ -193,8 +193,9 @@ class ArrayPadFieldProbeTest {
     // Candidate-spot legality scan for the two algorithm-missed U1 balls: does ANY legal
     // via position exist within dogbone reach? Binary outcome: fanout bug vs rules-impossible.
     var scan_tree = board.search_tree_manager.get_default_tree();
+    Map<String, Integer> scan_verdicts = new java.util.TreeMap<>();
     for (Item item : board.get_items()) {
-      if (!(item instanceof Pin pin) || (pin.get_id_no() != 188 && pin.get_id_no() != 189)) {
+      if (!(item instanceof Pin pin) || !unescaped_ids.contains(pin.get_id_no())) {
         continue;
       }
       FloatPoint c = pin.get_center().to_float();
@@ -233,11 +234,12 @@ class ArrayPadFieldProbeTest {
           }
         }
       }
-      System.out.println("[pad-array] spot-scan pin=" + pin.get_id_no()
-          + " legal_spots_post_fanout=" + legal_spots
-          + " legal_spots_pre_fanout=" + legal_spots_pre
-          + " nearest=" + (legal_spots == 0 ? "none" : String.valueOf(Math.round(nearest))));
+      String comp_name = board.components.get(pin.get_component_no()).name;
+      String verdict = legal_spots > 0 ? "ESCAPABLE_NOW"
+          : legal_spots_pre > 0 ? "ORDERING_VICTIM" : "RULES_IMPOSSIBLE";
+      scan_verdicts.merge(comp_name + ":" + verdict, 1, Integer::sum);
     }
+    System.out.println("[pad-array] spot-scan verdicts=" + scan_verdicts);
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width

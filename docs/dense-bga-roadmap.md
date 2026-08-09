@@ -147,3 +147,22 @@ flagged; the spatial scan is the correct feasibility test and should replace it 
 classifier graduates to production. Achievable-escape work therefore moves to U5/U2/U6
 (spatial scan as the tool), and exercising Phase-1 span machinery still requires the
 microvia fixture variant.
+
+## Escape accounting COMPLETE (measured 2026-08-09)
+
+The spot scan generalized to all 57 unescaped pins:
+`{C21:1, C22:1, J3:3, J6:3, J8:1, R5:1, U1:9, U2:9, U3:1, U4:2, U5:28, U6:6}` --
+**every single one RULES_IMPOSSIBLE** (zero ESCAPABLE_NOW, zero ORDERING_VICTIM, pre- and
+post-fanout). Under this design's via rules the fanout stage is PERFECT: 246/303 escaped is
+exactly the escapable set.
+
+Consequences:
+- Via-escape improvement on this fixture is a dead end without the **microvia fixture
+  variant** -- now the single prerequisite for all Phase 1/2 escape machinery.
+- The router's remaining real gap on this board is the **59 unrouted connections**, some of
+  which involve unescaped pins that may still be routable DIRECTLY on the surface layers
+  (escape-via and routability are different questions). Measuring how many of the 59 are
+  surface-achievable is the next diagnostic; Phase 3 (negotiation) and surface-routing
+  quality are the levers for those.
+- The spatial spot scan is the production feasibility test (the v1 interior/boundary
+  heuristic is retired -- it over-counted 48 of 57).
