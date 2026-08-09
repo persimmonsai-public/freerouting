@@ -125,7 +125,7 @@ public class Issue420ContributionBoardRoutingTest extends RoutingFixtureTest {
 
     Duration duration = completed.getDuration();
     var statsAfter = GetBoardStatistics(completed);
-    System.out.println("Issue420 optimizer test completed in "
+    IO.println("Issue420 optimizer test completed in "
         + FRLogger.formatDuration(duration.toSeconds())
         + " with " + statsAfter.connections.incompleteCount + " incomplete connections"
         + " and " + statsAfter.clearanceViolations.totalCount + " clearance violations.");
