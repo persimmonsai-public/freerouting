@@ -315,3 +315,26 @@ PROTECTIVE: per-commit validation only proves legality, not endgame-compatibilit
 10 extra contested commits steal corridors. v1 (winner-filter + long-connection gate,
 989.72/2) stands. The v2 direction for 8-layer congestion remains iterative
 reroute-of-losers WITH the filter, not instead of it.
+
+## Negotiation v2 second variant (reroute-losers) also REFUTED (2026-08-09)
+
+Winner-retention with eviction of contested routes (winners keep routes across rounds;
+only losers re-search against risen prices): deterministic 2/2 but 974.34/5 with 6
+commits -- worse than v1's full re-search (989.72/2, 8 commits). Early winners lock
+corridors that full re-search would have re-optimized; with pricing, re-searching
+EVERYONE each round is the better schedule at this scale. v1 stands. Both v2 variants
+are now measured refutations; a future v3 would need per-round price decay or randomized
+restarts, and belongs with the Phase-4 cost work (fast dry-runs make more rounds
+affordable, which is what negotiation quality actually needs).
+
+## Campaign close-out status (2026-08-09)
+
+- Phases 0-3: implemented, measured, gate-verified (see sections above).
+- Phase 4: opening profile measured (~122 ms/dry-run at 8 layers); both quick negotiation-v2
+  variants refuted; remaining items are the three known builds: persistent net overlays
+  (re-measuring the incremental economics at 8-layer scale), threaded dry rounds, and a
+  v3 negotiation schedule enabled by cheap dry-runs.
+- Phase 5 (diff pairs, length matching, plane/antipad reporting): not started; each is a
+  session-scale build with its design sketched in the Phase-5 section above.
+
+Every flag defaults off; both fixture gates verified unbroken after every landing.
