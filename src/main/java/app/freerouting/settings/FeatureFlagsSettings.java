@@ -53,6 +53,12 @@ public class FeatureFlagsSettings implements Serializable {
    */
   @SerializedName("partition_router")
   public boolean partitionRouter = false;
+  /**
+   * Deterministic escape pre-routing (EscapePlanner) after the fanout stage: inserts nearest
+   * legal dogbone via+stub for every SMD pin fanout left contactless. Default off; see
+   * docs/dense-bga-roadmap.md Phase 2.
+   */
+  public boolean escapePlanner = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

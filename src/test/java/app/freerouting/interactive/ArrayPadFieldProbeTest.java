@@ -46,6 +46,7 @@ class ArrayPadFieldProbeTest {
   void setUp() {
     Freerouting.globalSettings = new GlobalSettings();
     InteractiveSettings.resetForTesting();
+    Freerouting.globalSettings.featureFlags.escapePlanner = Boolean.getBoolean("fr.escape");
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {
       scheduler.jobs.clear();

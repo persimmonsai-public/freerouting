@@ -207,3 +207,24 @@ work relevant only to richer via sets. Remaining gap (56 unrouted vs 55 achievab
 is Phase-2 planning + Phase-3 negotiation; fanout "misses" were re-diagnosed as full-route
 failures (fanout = autoroute_connection to the nearest net target, not bare via placement),
 so they are the same routing problem, not a separate via-placement defect.
+
+## Phase 2 v1: EscapePlanner built, soundness-validated, fixture-limited (2026-08-09)
+
+EscapePlanner (featureFlags.escapePlanner, default off) inserts nearest-first dogbone
+via+stub escapes for pins fanout leaves contactless, wired after the fanout stage.
+Validation ran in both directions:
+
+- With pour-passable via placement (WRONG semantics): 25 escapes, unrouted 56 -> 49 (best
+  raw connectivity yet) but +12 SCORED violation pairs -- discovered to come from
+  DIRECTIONAL obstacle asymmetry: a via inside a foreign pour is clean from the via's side
+  while the pour's DRC counts it, and the score counts the pour's side. Fanout's own maze
+  (is_drill_obstacle) avoids foreign pours, which is why the baseline adds zero.
+- With bidirectional semantics (CORRECT): 0 insertions, 0 added violations -- on THIS
+  fixture every remaining unescaped pin's neighbourhood is covered by foreign pours, so
+  gate-clean escapes beyond fanout's 248/303 do not exist. The planner correctly declines.
+
+Verdict: items 1-2 machinery is COMPLETE and sound; its positive yield needs either a
+fixture whose escape zones are not pour-covered, or pour-REFLOW modelling (treat pours as
+regenerable: route through them and subtract at export -- how the source CAD behaves).
+Pour-reflow modelling is the newly-discovered real unlock for this class of board and
+joins the roadmap as the successor to the microvia variant.

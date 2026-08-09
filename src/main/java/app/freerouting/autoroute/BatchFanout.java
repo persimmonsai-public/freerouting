@@ -137,6 +137,12 @@ public class BatchFanout {
       }
       lastBoardHash = currentBoardHash;
     }
+    if (app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.escapePlanner
+        && p_board instanceof app.freerouting.board.RoutingBoard routing_board) {
+      int planned = EscapePlanner.plan_escapes(routing_board);
+      FRLogger.info("[escape-planner] inserted " + planned + " dogbone escapes for pins fanout left contactless");
+    }
     BoardStatistics stats = new BoardStatistics(p_board, null, false);
     EscapeStatistics finalEscape = EscapeStatistics.fromBoardStatistics(stats);
     long totalDurationMillis = Math.max(0, System.currentTimeMillis() - fanoutStart);
