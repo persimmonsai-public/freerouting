@@ -48,6 +48,7 @@ class ArrayPadFieldProbeTest {
     InteractiveSettings.resetForTesting();
     Freerouting.globalSettings.featureFlags.escapePlanner = Boolean.getBoolean("fr.escape");
     Freerouting.globalSettings.featureFlags.reflowablePours = Boolean.getBoolean("fr.reflow");
+    Freerouting.globalSettings.featureFlags.negotiatedRouter = Boolean.getBoolean("fr.negotiate");
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {
       scheduler.jobs.clear();

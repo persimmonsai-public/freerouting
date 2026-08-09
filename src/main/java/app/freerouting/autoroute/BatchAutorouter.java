@@ -447,6 +447,122 @@ public class BatchAutorouter extends NamedAlgorithm {
   private long partition_routed_count;
   private long partition_fallback_count;
   private long partition_drc_reject_count;
+
+  private static boolean isNegotiatedRouterEnabled() {
+    return app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.negotiatedRouter;
+  }
+
+  private record NegotiationConn(Item item, int net_no) {
+  }
+
+  /**
+   * Phase-3 congestion negotiation (docs/dense-bga-roadmap.md): dry-run every queued
+   * connection over the partition room cover with congestion pricing (no net-lift, no
+   * commits), raise prices on overused rooms each round, and finally commit -- through the
+   * fully validated partition path -- only the connections whose final routes use no
+   * overused room. Everything else falls to the classic per-connection loop unchanged.
+   */
+  private void run_negotiation(List<Item> p_items) {
+    long t0 = System.currentTimeMillis();
+    List<NegotiationConn> conns = new ArrayList<>();
+    for (Item item : p_items) {
+      for (int i = 0; i < item.net_count(); i++) {
+        conns.add(new NegotiationConn(item, item.get_net_no(i)));
+      }
+    }
+    Map<String, Double> prices = new HashMap<>();
+    Map<String, Integer> usage = new HashMap<>();
+    Map<String, Integer> capacity = new HashMap<>();
+    Map<NegotiationConn, PartitionRouter.CellRoute> routes = new HashMap<>();
+    final int ROUNDS = 2;
+    final double OVERUSE_PRICE = 50000;
+    int rounds_run = 0;
+    for (int round = 0; round < ROUNDS; round++) {
+      ++rounds_run;
+      usage.clear();
+      routes.clear();
+      for (NegotiationConn conn : conns) {
+        Set<Item> connected = conn.item().get_connected_set(conn.net_no());
+        Set<Item> unconnected = conn.item().get_unconnected_set(conn.net_no());
+        if (unconnected.isEmpty()) {
+          continue;
+        }
+        AutorouteControl ctrl = new AutorouteControl(this.board, conn.net_no(), settings,
+            this.settings.get_via_costs(), this.trace_cost_arr);
+        if (partition_router == null) {
+          partition_router = new PartitionRouter(board,
+              board.search_tree_manager.get_autoroute_tree(ctrl.trace_clearance_class_no));
+        }
+        partition_router.set_room_prices(prices);
+        PartitionRouter.CellRoute route;
+        try {
+          // Lifted search: the lift-free mode found zero routes (start contacts need the
+          // connection shape inside a room, i.e. the lifted pad interiors).
+          route = partition_router.try_route(connected, unconnected,
+              ctrl.compensated_trace_half_width, true);
+        } catch (Exception e) {
+          route = null;
+        }
+        if (route == null) {
+          continue;
+        }
+        routes.put(conn, route);
+        int half_width = Math.max(1, ctrl.compensated_trace_half_width[route.layer]);
+        for (FreeSpacePartition.Room room : route.rooms) {
+          String key = PartitionRouter.box_key(room.box);
+          usage.merge(key, 1, Integer::sum);
+          int min_dim = Math.min(room.box.ur.x - room.box.ll.x, room.box.ur.y - room.box.ll.y);
+          capacity.putIfAbsent(key, Math.max(1, min_dim / (6 * half_width)));
+        }
+      }
+      boolean overuse = false;
+      for (Map.Entry<String, Integer> use : usage.entrySet()) {
+        int cap = capacity.getOrDefault(use.getKey(), 1);
+        if (use.getValue() > cap) {
+          overuse = true;
+          prices.merge(use.getKey(), OVERUSE_PRICE * (use.getValue() - cap), Double::sum);
+        }
+      }
+      if (!overuse) {
+        break;
+      }
+    }
+    // Commit phase: winners re-search WITH the final prices through the validated path.
+    int committed = 0;
+    int candidates = 0;
+    for (Map.Entry<NegotiationConn, PartitionRouter.CellRoute> entry : routes.entrySet()) {
+      boolean clean = true;
+      for (FreeSpacePartition.Room room : entry.getValue().rooms) {
+        String key = PartitionRouter.box_key(room.box);
+        if (usage.getOrDefault(key, 0) > capacity.getOrDefault(key, 1)) {
+          clean = false;
+          break;
+        }
+      }
+      if (!clean) {
+        continue;
+      }
+      ++candidates;
+      NegotiationConn conn = entry.getKey();
+      Set<Item> connected = conn.item().get_connected_set(conn.net_no());
+      Set<Item> unconnected = conn.item().get_unconnected_set(conn.net_no());
+      if (unconnected.isEmpty()) {
+        continue; // connected as a side effect of an earlier negotiation commit
+      }
+      AutorouteControl ctrl = new AutorouteControl(this.board, conn.net_no(), settings,
+          this.settings.get_via_costs(), this.trace_cost_arr);
+      AutorouteAttemptResult result = try_partition_route(connected, unconnected, ctrl);
+      if (result != null && result.state == AutorouteAttemptState.ROUTED) {
+        ++committed;
+      }
+    }
+    partition_router.set_room_prices(null);
+    job.logInfo("[negotiation] connections=" + conns.size() + " rounds=" + rounds_run
+        + " routed_in_final_round=" + routes.size() + " clean_candidates=" + candidates
+        + " committed=" + committed
+        + " in " + (System.currentTimeMillis() - t0) + " ms");
+  }
   /**
    * Attempts the connection over the free-space partition. Returns a ROUTED result on success,
    * or null when the classic engine should handle the connection instead (no route found in the
@@ -582,6 +698,9 @@ public class BatchAutorouter extends NamedAlgorithm {
         return false;
       }
 
+      if (isNegotiatedRouterEnabled() && p_pass_no == 1) {
+        run_negotiation(autoroute_item_list);
+      }
       int items_to_go_count = autoroute_item_list.size();
       int ripped_item_count = 0;
       int not_routed = 0;

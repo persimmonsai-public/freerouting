@@ -66,6 +66,12 @@ public class FeatureFlagsSettings implements Serializable {
    * Unlocks escapes/routes through pour-covered regions (dense-BGA boards). Default off.
    */
   public boolean reflowablePours = false;
+  /**
+   * Phase-3 congestion negotiation (PathFinder-style) over the partition room graph: dry-run
+   * all pass-1 connections with congestion pricing, iterate until overuse subsides, commit
+   * clean winners through the validated partition path. Default off.
+   */
+  public boolean negotiatedRouter = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

@@ -40,6 +40,7 @@ class RoutingProfileTest {
     Freerouting.globalSettings.featureFlags.partitionRouter = Boolean.getBoolean("fr.partition");
     Freerouting.globalSettings.featureFlags.escapePlanner = Boolean.getBoolean("fr.escape");
     Freerouting.globalSettings.featureFlags.reflowablePours = Boolean.getBoolean("fr.reflow");
+    Freerouting.globalSettings.featureFlags.negotiatedRouter = Boolean.getBoolean("fr.negotiate");
     InteractiveSettings.resetForTesting();
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {

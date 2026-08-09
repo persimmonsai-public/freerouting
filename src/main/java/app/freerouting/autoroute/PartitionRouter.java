@@ -63,6 +63,27 @@ public final class PartitionRouter {
    */
   private final FreeSpacePartition[] partitions;
   private boolean dirty = true;
+  /**
+   * Congestion prices for negotiation, keyed by room BOX (stable across partition rebuilds,
+   * unlike Room object identity). Null disables pricing.
+   */
+  private Map<String, Double> room_prices;
+
+  public void set_room_prices(Map<String, Double> p_prices) {
+    this.room_prices = p_prices;
+  }
+
+  public static String box_key(IntBox p_box) {
+    return p_box.ll.x + ":" + p_box.ll.y + ":" + p_box.ur.x + ":" + p_box.ur.y;
+  }
+
+  private double price_of(IntBox p_box) {
+    if (room_prices == null) {
+      return 0;
+    }
+    Double price = room_prices.get(box_key(p_box));
+    return price == null ? 0 : price;
+  }
 
   public PartitionRouter(RoutingBoard p_board, ShapeSearchTree p_tree) {
     this.board = p_board;
@@ -129,6 +150,17 @@ public final class PartitionRouter {
    *     full trace width to be traversable
    */
   public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width) {
+    return try_route(p_start_set, p_dest_set, p_half_width, true);
+  }
+
+  /**
+   * As above; p_lift false runs WITHOUT the net-lift (and without dirtying the partition):
+   * the cheap dry-run mode negotiation rounds use. Connections whose targets are drill
+   * items (pad-centre connection shapes) mostly fail without the lift; post-fanout, most
+   * targets are trace endpoints in open space, which succeed.
+   */
+  public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width,
+      boolean p_lift) {
     ensure_fresh();
     // The routing net's own items must not be walls: Locate seeds the destination from the
     // item's CONNECTION shape -- the pad center point for drill items, the centerline for
@@ -144,15 +176,17 @@ public final class PartitionRouter {
       // rebuilds per attempt; those connections go to the classic engine.
       return null;
     }
-    for (FreeSpacePartition partition : partitions) {
-      if (partition == null) {
-        continue;
+    if (p_lift) {
+      for (FreeSpacePartition partition : partitions) {
+        if (partition == null) {
+          continue;
+        }
+        partition.begin_bulk();
+        for (Item item : net_items) {
+          partition.remove(item.get_id_no());
+        }
+        partition.end_bulk();
       }
-      partition.begin_bulk();
-      for (Item item : net_items) {
-        partition.remove(item.get_id_no());
-      }
-      partition.end_bulk();
     }
     try {
       CellRoute best = null;
@@ -265,7 +299,8 @@ public final class PartitionRouter {
         if (Math.max(dx, dy) < min_pass) {
           continue; // the overlap cannot host a trace-wide crossing
         }
-        double candidate = g[current] + center_distance(room.box, neighbor.box);
+        double candidate = g[current] + center_distance(room.box, neighbor.box)
+            + price_of(neighbor.box);
         if (candidate < g[neighbor.index]) {
           g[neighbor.index] = candidate;
           came_from[neighbor.index] = current;

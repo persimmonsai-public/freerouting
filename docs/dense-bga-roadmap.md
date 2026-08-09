@@ -248,3 +248,22 @@ level; conversion is Phase-3 (negotiation / budget) work. Items 1-2 of the featu
 assessment are complete: detection, feasibility (three semantic corrections, all measured),
 span selection (ordered fallback), the planner, and pour-reflow -- each behind flags, each
 validated in both directions.
+
+## Phase 3 v1: congestion negotiation implemented (2026-08-09)
+
+`featureFlags.negotiatedRouter` (-Dfr.negotiate, default off): at pass-1 start, every queued
+connection is dry-run over the partition room cover (lifted search; the lift-free mode was
+measured to find zero routes -- start contacts need pad interiors inside rooms); overused
+rooms (usage > width-derived capacity) get priced each round; after the rounds, only
+connections whose final routes use no overused room commit, through the fully validated
+partition path; the classic loop handles the rest untouched.
+
+First measurement (2-layer fixture): 233 connections, 2 rounds, 182 routed in the final
+round, 44 clean candidates, **19 committed, gate score held exactly (989.72 / 2 / 0)** --
+more gate-clean partition commits than the per-connection quality mode (11-12). Cost: 33 s
+of negotiation, 70.9 s total vs 37.4 s baseline. The pipeline is proven: pricing locates
+real contention (182 -> 44), commits are sound, and the remaining work is COST, not
+correctness -- the ~70 ms lifted search per dry-run is the same per-attempt anatomy
+profiled in the partition campaign, with the same known levers (persistent net overlays
+instead of lift/rebuild cycles, cheaper heuristics). Tuning capacity/rounds/pricing and
+the 8-layer measurement are the follow-ons.
