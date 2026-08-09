@@ -166,3 +166,21 @@ Consequences:
   quality are the levers for those.
 - The spatial spot scan is the production feasibility test (the v1 interior/boundary
   heuristic is retired -- it over-counted 48 of 57).
+
+## RETRACTION + corrected accounting (measured 2026-08-09)
+
+The "all 57 rules-impossible / fanout is perfect" verdict was WRONG -- an artifact of the
+spot scan treating copper pours as obstacles. The board's ConductionAreas have
+get_is_obstacle()==false (pours reflow; the router treats them as passable), and with pour
+semantics honored the accounting inverts:
+
+- ORIGINAL fixture: 34 ESCAPABLE_NOW (legal spots exist post-fanout -- concrete fanout
+  misses), 29 ORDERING_VICTIM (spots existed pre-fanout, consumed by neighbours -- the
+  Phase-2 planning case), only 3 RULES_IMPOSSIBLE.
+- MICROVIA variant (fixtures/Issue732-RoyalBlue54L-Feather-microvia.dsn, adds a 300:150 um
+  blind 0-1 via; 400 um was measured too big -- rectangular pad corners govern the diagonal):
+  55/55 escapable-or-ordering, zero impossible. Fanout with the microvia present: 248/303.
+
+Consequences: items 1-2 have real targets on BOTH fixtures; the feasibility classifier must
+use is-obstacle semantics (pours passable, spans respected) when it graduates to
+production; and the fanout stage has ~34 diagnosable misses on the original board.

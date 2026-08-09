@@ -78,9 +78,19 @@ class ArrayPadFieldProbeTest {
         unescaped_ids.add(pin.get_id_no());
       }
     }
-    var via_padstack = board.rules.via_infos.get(0).get_padstack();
-    IntBox via_shape = via_padstack.get_shape(via_padstack.from_layer()).bounding_box();
-    int via_radius = (via_shape.ur.x - via_shape.ll.x) / 2;
+    int via_radius = Integer.MAX_VALUE; // feasibility uses the SMALLEST available via
+    int via_from_layer = 0;
+    int via_to_layer = board.get_layer_count() - 1;
+    for (int v = 0; v < board.rules.via_infos.count(); v++) {
+      var ps = board.rules.via_infos.get(v).get_padstack();
+      IntBox vb = ps.get_shape(ps.from_layer()).bounding_box();
+      int r = (vb.ur.x - vb.ll.x) / 2;
+      if (r < via_radius) {
+        via_radius = r;
+        via_from_layer = ps.from_layer();
+        via_to_layer = ps.to_layer();
+      }
+    }
     int clearance = board.rules.clearance_matrix.get_value(1, 1, 0, false);
     for (Map.Entry<Integer, List<Pin>> entry : pins_by_component.entrySet()) {
       List<Pin> pins = entry.getValue();
@@ -194,6 +204,7 @@ class ArrayPadFieldProbeTest {
     // via position exist within dogbone reach? Binary outcome: fanout bug vs rules-impossible.
     var scan_tree = board.search_tree_manager.get_default_tree();
     Map<String, Integer> scan_verdicts = new java.util.TreeMap<>();
+    int dbg_diag_logged = 0;
     for (Item item : board.get_items()) {
       if (!(item instanceof Pin pin) || !unescaped_ids.contains(pin.get_id_no())) {
         continue;
@@ -212,10 +223,14 @@ class ArrayPadFieldProbeTest {
           IntBox via_box = new IntBox(cx - via_radius, cy - via_radius, cx + via_radius, cy + via_radius);
           boolean legal_post = true;
           boolean legal_pre = true; // ignoring fanout-added traces/vias: the pre-fanout board
-          for (int layer = 0; layer < board.get_layer_count() && legal_pre; layer++) {
+          for (int layer = via_from_layer; layer <= via_to_layer && legal_pre; layer++) {
             for (var entry : scan_tree.overlapping_tree_entries_with_clearance(
                 via_box, layer, new int[0], 1)) {
               if (entry.object instanceof Item blocking && !blocking.shares_net(pin)) {
+                if (blocking instanceof app.freerouting.board.ConductionArea pour
+                    && !pour.get_is_obstacle()) {
+                  continue; // pours reflow around new copper; the router treats them as passable
+                }
                 legal_post = false;
                 if (!(blocking instanceof app.freerouting.board.Trace)
                     && !(blocking instanceof app.freerouting.board.Via)) {
@@ -235,6 +250,24 @@ class ArrayPadFieldProbeTest {
         }
       }
       String comp_name = board.components.get(pin.get_component_no()).name;
+      if (comp_name.equals("U1") && dbg_diag_logged < 1) {
+        ++dbg_diag_logged;
+        for (int[] d : new int[][]{{4500, 4500}, {-4500, 4500}, {4500, -4500}, {-4500, -4500}}) {
+          int cx = (int) c.x + d[0];
+          int cy = (int) c.y + d[1];
+          IntBox via_box = new IntBox(cx - via_radius, cy - via_radius, cx + via_radius, cy + via_radius);
+          for (int layer = via_from_layer; layer <= via_to_layer; layer++) {
+            for (var entry : scan_tree.overlapping_tree_entries_with_clearance(via_box, layer, new int[0], 1)) {
+              if (entry.object instanceof Item blocking && !blocking.shares_net(pin)) {
+                System.out.println("[pad-array] diag-blocker pin=" + pin.get_id_no()
+                    + " cand=(" + d[0] + "," + d[1] + ") layer=" + layer
+                    + " item=" + blocking.getClass().getSimpleName() + "#" + blocking.get_id_no()
+                    + " cl_class=" + blocking.clearance_class_no());
+              }
+            }
+          }
+        }
+      }
       String verdict = legal_spots > 0 ? "ESCAPABLE_NOW"
           : legal_spots_pre > 0 ? "ORDERING_VICTIM" : "RULES_IMPOSSIBLE";
       scan_verdicts.merge(comp_name + ":" + verdict, 1, Integer::sum);
