@@ -131,6 +131,18 @@ class ArrayPadFieldProbeTest {
       }
     }
     System.out.println("[pad-array] unescaped_smd_by_component=" + unescaped_by_component);
+    // Via rules: is the U1 inner-ball escape geometrically possible under this design?
+    for (int v = 0; v < board.rules.via_infos.count(); v++) {
+      var info = board.rules.via_infos.get(v);
+      var padstack = info.get_padstack();
+      IntBox via_box = padstack.get_shape(padstack.from_layer()) == null ? null
+          : padstack.get_shape(padstack.from_layer()).bounding_box();
+      System.out.println("[pad-array] via name=" + info.get_name()
+          + " layers=" + padstack.from_layer() + ".." + padstack.to_layer()
+          + " size=" + (via_box == null ? "?" : (via_box.ur.x - via_box.ll.x) + "x" + (via_box.ur.y - via_box.ll.y))
+          + " attach_smd=" + info.attach_smd_allowed());
+    }
+    System.out.println("[pad-array] default_clearance=" + board.rules.clearance_matrix.get_value(1, 1, 0, false));
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width

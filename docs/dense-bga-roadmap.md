@@ -114,3 +114,23 @@ output; the router adds ZERO violations. The gate is therefore: unrouted <= 59,
 violations <= 538 (none added), score >= 451.97, within the 20-minute budget. Phase 0
 complete; Phase 1 (region rules + via spans) is next, targeting the 59 unrouted and the
 57 unescaped fanout pins.
+
+## Phase 1 pivot (measured 2026-08-09)
+
+The gate board's rules offer exactly ONE via: 8000x8000 through-hole spanning all 8 layers,
+attach_smd=false, default clearance 1500. Dogbone feasibility at U1 (9000 pitch, 5000x4000
+pads): the grid-diagonal via position is ~6364 from each ball but needs
+4000 + 1500 + ~2000 = 7500 -- **inner-ball escape is geometrically impossible under the
+design's own rules.** The 9 unescaped U1 balls (and likely U2's) are unroutable-by-rules,
+not router failures.
+
+Consequences, in order:
+1. Phase 2's planner gains an **escape-feasibility classifier** (detector geometry + via
+   rules + clearance): each unescaped ball is labeled rules-impossible vs algorithm-missed;
+   only the second class counts against the router. The achievable-unrouted number replaces
+   59 as the real target once measured.
+2. To exercise Phase 1's span-aware/microvia machinery at all, Phase 0 gains an addendum:
+   a fixture VARIANT adding a plausible microvia (e.g. 4000:2000 um, layers 0-1) to the DSN
+   via set -- then U1 inner-ball escape becomes legal and the machinery is measurable.
+3. Region-scoped rules remain valuable for trace necking between balls (2500-unit traces in
+   4000-5000-unit gaps is workable) independent of the via problem.
