@@ -92,6 +92,21 @@ public final class PartitionRouter {
   }
 
   /**
+   * Builds everything overlay-mode queries touch (partitions, room covers, adjacency) so that
+   * subsequent {@code try_route(..., p_lift=false)} calls are pure reads -- the precondition
+   * for running dry-run searches on multiple threads.
+   */
+  public void warm_up() {
+    ensure_fresh();
+    for (FreeSpacePartition partition : partitions) {
+      if (partition != null) {
+        // rooms() builds cells, the room cover and the room adjacency in one go.
+        partition.rooms();
+      }
+    }
+  }
+
+  /**
    * Marks the partitions stale; they are rebuilt wholesale on the next search. A full rebuild
    * was measured at 21 ms for the reference board, so per-commit incremental maintenance is
    * deliberately deferred until the wholesale cost shows up in a profile.
@@ -163,10 +178,13 @@ public final class PartitionRouter {
   }
 
   /**
-   * As above; p_lift false runs WITHOUT the net-lift (and without dirtying the partition):
-   * the cheap dry-run mode negotiation rounds use. Connections whose targets are drill
-   * items (pad-centre connection shapes) mostly fail without the lift; post-fanout, most
-   * targets are trace endpoints in open space, which succeed.
+   * As above; p_lift false runs the OVERLAY mode: no physical net-lift, no partition
+   * mutation, no dirtying -- own-net transparency is applied at CONTACT level instead
+   * (a contact is accepted when the item's connection shape intersects the room OR the
+   * item's own footprint, which is exactly the region a lifted room would grow over).
+   * The shared partition stays fresh across any number of overlay searches, so the
+   * per-search lift -> dirty -> wholesale cells+rooms rebuild cycle (~70 ms at 2-layer,
+   * ~122 ms at 8-layer) disappears; negotiation dry rounds use this mode.
    */
   public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width,
       boolean p_lift) {
@@ -205,7 +223,7 @@ public final class PartitionRouter {
           continue;
         }
         CellRoute route = try_route_on_layer(layer, p_start_set, p_dest_set,
-            Math.max(1, p_half_width[layer]));
+            Math.max(1, p_half_width[layer]), !p_lift);
         if (route != null) {
           double cost = route_length(route);
           // Quality guard: a partition route much longer than the straight terminal distance
@@ -225,10 +243,13 @@ public final class PartitionRouter {
       }
       return best;
     } finally {
-      // Every attempt is followed by invalidate() from the caller (staleness-vs-quality
-      // tradeoff measured in BatchAutorouter), so re-inserting the lifted net into
-      // partitions that are about to be rebuilt wholesale is pure waste; just mark dirty.
-      dirty = true;
+      if (p_lift) {
+        // Every lifted attempt is followed by invalidate() from the caller (staleness-vs-
+        // quality tradeoff measured in BatchAutorouter), so re-inserting the lifted net into
+        // partitions that are about to be rebuilt wholesale is pure waste; just mark dirty.
+        // Overlay searches never mutate the partition, so it stays fresh.
+        dirty = true;
+      }
     }
   }
 
@@ -241,15 +262,17 @@ public final class PartitionRouter {
   }
 
   private CellRoute try_route_on_layer(int p_layer, Set<Item> p_start_set, Set<Item> p_dest_set,
-      int p_half_width) {
+      int p_half_width, boolean p_own_net_transparent) {
     FreeSpacePartition partition = partitions[p_layer];
     // Rooms abutting an item shape, with the shape's tree entry number for door construction.
     // Both sides require the CONNECTION shape to reach the room: Locate walks toward the
     // start item's connection shape intersected with the start room (a trace's connection
     // shape exists only near its endpoints), and an empty intersection makes its target
     // corner land on the 2^25 sentinel coordinate -- measured as the dominant reject.
-    Map<FreeSpacePartition.Room, ItemContact> starts = contact_rooms(partition, p_start_set, p_layer, p_half_width, true);
-    Map<FreeSpacePartition.Room, ItemContact> targets = contact_rooms(partition, p_dest_set, p_layer, p_half_width, true);
+    Map<FreeSpacePartition.Room, ItemContact> starts =
+        contact_rooms(partition, p_start_set, p_layer, p_half_width, p_own_net_transparent);
+    Map<FreeSpacePartition.Room, ItemContact> targets =
+        contact_rooms(partition, p_dest_set, p_layer, p_half_width, p_own_net_transparent);
     if (starts.isEmpty() || targets.isEmpty()) {
       return null;
     }
@@ -269,7 +292,13 @@ public final class PartitionRouter {
     int[] came_from = new int[rooms.size()];
     java.util.Arrays.fill(g, Double.MAX_VALUE);
     java.util.Arrays.fill(came_from, -1);
-    PriorityQueue<double[]> open = new PriorityQueue<>((a, b) -> Double.compare(a[0], b[0]));
+    // Tie-break equal costs on room index: PriorityQueue pop order among equal keys is
+    // arbitrary, and tie-prone costs have twice turned identity-ordered iteration into
+    // nondeterministic final scores (ledger: heuristic experiment, commit-phase ordering).
+    PriorityQueue<double[]> open = new PriorityQueue<>((a, b) -> {
+      int by_cost = Double.compare(a[0], b[0]);
+      return by_cost != 0 ? by_cost : Double.compare(a[1], b[1]);
+    });
     for (FreeSpacePartition.Room start : starts.keySet()) {
       // Thin terminal rooms are excluded outright: Locate erodes start/target rooms exactly
       // like intermediate ones, and a thin terminal degenerates the whole corner walk
@@ -345,12 +374,22 @@ public final class PartitionRouter {
 
   /**
    * Rooms that touch (within p_touch_margin) a shape of any of the items on the layer, mapped
-   * to that item and shape index.
+   * to that item and shape index. Iteration order of the returned map is deterministic:
+   * items are visited in id order and rooms in partition list order (seeding order feeds the
+   * A* tie-breaks, so identity-hash order here would make outcomes run-dependent).
+   *
+   * <p>p_own_net_transparent is the overlay mode's contact rule: the physical net-lift grows
+   * rooms over the removed items' footprints, so a lifted room intersects the connection
+   * shape whenever the shared-partition room OR the item's own footprint does. Testing
+   * connection-vs-own-shape reproduces that acceptance without mutating the partition (the
+   * pad-centre connection shape of a drill item always intersects its own pad).
    */
   private Map<FreeSpacePartition.Room, ItemContact> contact_rooms(FreeSpacePartition p_partition,
-      Set<Item> p_items, int p_layer, int p_touch_margin, boolean p_require_connection_shape) {
-    Map<FreeSpacePartition.Room, ItemContact> result = new HashMap<>();
-    for (Item item : p_items) {
+      Set<Item> p_items, int p_layer, int p_touch_margin, boolean p_own_net_transparent) {
+    Map<FreeSpacePartition.Room, ItemContact> result = new java.util.LinkedHashMap<>();
+    List<Item> items = new ArrayList<>(p_items);
+    items.sort((a, b) -> Integer.compare(a.get_id_no(), b.get_id_no()));
+    for (Item item : items) {
       int shape_count = item.tree_shape_count(tree);
       for (int i = 0; i < shape_count; i++) {
         if (item.shape_layer(i) != p_layer) {
@@ -360,6 +399,16 @@ public final class PartitionRouter {
         if (shape == null || shape.is_empty()) {
           continue;
         }
+        // Locate's destination side seeds from the item's CONNECTION shape (for traces it
+        // exists only near the endpoints), so a contact that only touches the tree shape
+        // is unusable as a target.
+        TileShape connection = ((app.freerouting.board.Connectable) item)
+            .get_trace_connection_shape(tree, i);
+        if (connection == null || connection.is_empty()) {
+          continue;
+        }
+        boolean own_footprint_contact = p_own_net_transparent
+            && !connection.intersection(shape).is_empty();
         IntBox probe = shape.bounding_box().offset(p_touch_margin);
         for (FreeSpacePartition.Room room : p_partition.rooms_intersecting(probe)) {
           // The bounding-box probe over-selects around diagonal shapes; the door built later
@@ -368,15 +417,8 @@ public final class PartitionRouter {
           if (shape.intersection(room.box).is_empty()) {
             continue;
           }
-          if (p_require_connection_shape) {
-            // Locate's destination side seeds from the item's CONNECTION shape (for traces it
-            // exists only near the endpoints), so a contact that only touches the tree shape
-            // is unusable as a target.
-            TileShape connection = ((app.freerouting.board.Connectable) item)
-                .get_trace_connection_shape(tree, i);
-            if (connection == null || connection.intersection(room.box).is_empty()) {
-              continue;
-            }
+          if (!own_footprint_contact && connection.intersection(room.box).is_empty()) {
+            continue;
           }
           // Attachment preference, by boundedness of the connection shape Locate will aim at:
           // vias and pins connect at a POINT (bounded), while a trace's connection shape is a

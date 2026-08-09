@@ -72,6 +72,14 @@ public class FeatureFlagsSettings implements Serializable {
    * clean winners through the validated partition path. Default off.
    */
   public boolean negotiatedRouter = false;
+  /**
+   * Runs the negotiation's dry-run searches on a fixed thread pool. Sound because overlay-mode
+   * dry runs never mutate the shared partition (own-net transparency is applied at contact
+   * level); deterministic because results are collected per connection index and processed in
+   * connection-list order, so pricing and winner selection are independent of completion
+   * order. Default off; only meaningful with {@link #negotiatedRouter}.
+   */
+  public boolean negotiatedRouterParallelDry = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

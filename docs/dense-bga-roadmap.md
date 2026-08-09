@@ -352,6 +352,50 @@ remain Phase 4's single real lever (with deterministic ordering -- sorted contac
 as a prerequisite noted for that build); (b) any future search change must re-verify
 determinism explicitly, twice now the silent failure mode of this codepath.
 
+## Phase 4 increment: persistent net overlays -- dry-run cost solved (2026-08-09)
+
+The lift -> dirty -> wholesale rebuild cycle is gone: overlay mode
+(`PartitionRouter.try_route(..., p_lift=false)`) never mutates the shared partition.
+Own-net transparency moves to CONTACT level -- a contact is accepted when the item's
+connection shape intersects the room OR the item's own footprint (`contact_rooms`'
+own-footprint rule), which is exactly the region a lifted room would have grown over
+(a drill item's pad-centre connection shape always intersects its own pad). Prerequisite
+determinism work landed with it: `contact_rooms` iterates items in id order into a
+LinkedHashMap, and the A* priority queue tie-breaks equal costs on room index.
+Measured in isolation (lifted dry rounds + determinism changes only): exact v1 result
+(989.72/2, 8 commits) -- the seeding order change is outcome-neutral.
+
+Two measured consequences of the shared room geometry:
+
+1. Usage is no longer diluted across per-net lifted geometries (in lifted mode, each
+   net's terminal rooms were unique objects with usage 1). First overlay run: clean
+   candidates collapsed 15 -> 6, 2 commits, **974.34/5 -- below gate**.
+2. The fix is PathFinder's own source/sink rule: TERMINAL rooms (a dry route's first and
+   last) are exempt from congestion accounting -- a route cannot avoid its own terminal
+   room, and in the shared partition a pin-field room is common to every connection
+   terminating there, so pricing it only poisons cleanliness without enabling any reroute.
+
+Result with terminal exemption + ROUNDS=8 (now affordable at ~0.7 s/round):
+**994.85/1/0 -- ABOVE the 989.72/2 gate, equal to the quality-mode champion** -- with
+negotiation at **5.8 s (was 33 s)**, 170 routed in the final round, 17 clean candidates,
+3 committed, verified 2/2 identical. Flag-off re-verified at exactly 989.72/2 (35.2 s).
+8-layer reflow negotiation: **2.0 s (was 37.3 s, ~18x)**, 109 dry routes in the final
+round, 8 clean candidates, 0 committed (span filter + lifted commit re-search still
+reject everything at this congestion -- the v3 schedule's problem), full-run gate held.
+
+## Phase 4 increment: threaded dry rounds (2026-08-09)
+
+`featureFlags.negotiatedRouterParallelDry` (-Dfr.negpar, default off): the negotiation's
+dry-run searches run on a fixed thread pool (min(8, cores)). Sound because overlay-mode
+dry runs are pure reads against the warmed-up partition (`PartitionRouter.warm_up()`
+builds every lazy structure before the rounds); deterministic because results are
+collected per connection index and processed in connection-list order -- pricing and
+winner selection are independent of completion order by construction. Measured on the
+2-layer fixture: **identical results to sequential** (170 routed final round, 17 clean,
+3 committed, 994.85/1/0), 2/2 identical runs, negotiation wall-clock **5.8 s -> 2.6 s**.
+The residual is the sequential remainder (connected-set walks feed the pool from the
+submitting loop; per-round A* is already ~3 ms/search).
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and

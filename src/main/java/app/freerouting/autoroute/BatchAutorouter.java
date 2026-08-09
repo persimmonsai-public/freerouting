@@ -463,6 +463,37 @@ public class BatchAutorouter extends NamedAlgorithm {
    * fully validated partition path -- only the connections whose final routes use no
    * overused room. Everything else falls to the classic per-connection loop unchanged.
    */
+  /**
+   * One overlay-mode dry-run search for the negotiation rounds: computes the connection's
+   * sets, runs the mutation-free partition search, stores the result at p_index and returns
+   * the compensated half width of the found route's layer (1 when no route). Pure reads
+   * against the warmed-up partition, so safe to run from the dry pool's worker threads.
+   */
+  private int dry_route(NegotiationConn p_conn, PartitionRouter.CellRoute[] p_routes, int p_index) {
+    p_routes[p_index] = null;
+    Set<Item> connected = p_conn.item().get_connected_set(p_conn.net_no());
+    Set<Item> unconnected = p_conn.item().get_unconnected_set(p_conn.net_no());
+    if (unconnected.isEmpty()) {
+      return 1;
+    }
+    AutorouteControl ctrl = new AutorouteControl(this.board, p_conn.net_no(), settings,
+        this.settings.get_via_costs(), this.trace_cost_arr);
+    PartitionRouter.CellRoute route;
+    try {
+      // Overlay search (p_lift=false): own-net transparency applied at contact level
+      // instead of the physical lift, so the shared partition is never mutated and the
+      // per-search lift -> dirty -> wholesale rebuild cycle disappears. (The original
+      // lift-free mode found zero routes because start contacts required the connection
+      // shape inside a room -- the overlay's own-footprint contact rule supplies that.)
+      route = partition_router.try_route(connected, unconnected,
+          ctrl.compensated_trace_half_width, false);
+    } catch (Exception e) {
+      route = null;
+    }
+    p_routes[p_index] = route;
+    return route == null ? 1 : Math.max(1, ctrl.compensated_trace_half_width[route.layer]);
+  }
+
   private void run_negotiation(List<Item> p_items) {
     long t0 = System.currentTimeMillis();
     List<NegotiationConn> conns = new ArrayList<>();
@@ -475,41 +506,72 @@ public class BatchAutorouter extends NamedAlgorithm {
     Map<String, Integer> usage = new HashMap<>();
     Map<String, Integer> capacity = new HashMap<>();
     Map<NegotiationConn, PartitionRouter.CellRoute> routes = new HashMap<>();
-    final int ROUNDS = 2;
+    final int ROUNDS = 8;
     final double OVERUSE_PRICE = 50000;
+    if (partition_router == null) {
+      if (conns.isEmpty()) {
+        return;
+      }
+      AutorouteControl first_ctrl = new AutorouteControl(this.board, conns.get(0).net_no(),
+          settings, this.settings.get_via_costs(), this.trace_cost_arr);
+      partition_router = new PartitionRouter(board,
+          board.search_tree_manager.get_autoroute_tree(first_ctrl.trace_clearance_class_no));
+    }
+    partition_router.set_room_prices(prices);
+    // Overlay dry runs are pure reads once everything lazy is built; build it before the
+    // rounds so the parallel mode's workers never race a lazy initialization.
+    partition_router.warm_up();
+    boolean parallel_dry = app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.negotiatedRouterParallelDry;
+    java.util.concurrent.ExecutorService dry_pool = parallel_dry
+        ? java.util.concurrent.Executors.newFixedThreadPool(
+            Math.min(8, Runtime.getRuntime().availableProcessors()))
+        : null;
     int rounds_run = 0;
+    try {
     for (int round = 0; round < ROUNDS; round++) {
       ++rounds_run;
       usage.clear();
       routes.clear();
-      for (NegotiationConn conn : conns) {
-        Set<Item> connected = conn.item().get_connected_set(conn.net_no());
-        Set<Item> unconnected = conn.item().get_unconnected_set(conn.net_no());
-        if (unconnected.isEmpty()) {
-          continue;
+      // Dry routes for this round, indexed by connection-list position. Searches are
+      // independent pure reads (overlay mode); results are assembled in list order below, so
+      // the parallel mode is deterministic by construction and identical to sequential.
+      PartitionRouter.CellRoute[] round_routes = new PartitionRouter.CellRoute[conns.size()];
+      int[] round_half_widths = new int[conns.size()];
+      if (dry_pool == null) {
+        for (int conn_index = 0; conn_index < conns.size(); conn_index++) {
+          round_half_widths[conn_index] = dry_route(conns.get(conn_index), round_routes, conn_index);
         }
-        AutorouteControl ctrl = new AutorouteControl(this.board, conn.net_no(), settings,
-            this.settings.get_via_costs(), this.trace_cost_arr);
-        if (partition_router == null) {
-          partition_router = new PartitionRouter(board,
-              board.search_tree_manager.get_autoroute_tree(ctrl.trace_clearance_class_no));
+      } else {
+        List<java.util.concurrent.Future<Integer>> futures = new ArrayList<>(conns.size());
+        for (int conn_index = 0; conn_index < conns.size(); conn_index++) {
+          final int fi = conn_index;
+          futures.add(dry_pool.submit(() -> dry_route(conns.get(fi), round_routes, fi)));
         }
-        partition_router.set_room_prices(prices);
-        PartitionRouter.CellRoute route;
-        try {
-          // Lifted search: the lift-free mode found zero routes (start contacts need the
-          // connection shape inside a room, i.e. the lifted pad interiors).
-          route = partition_router.try_route(connected, unconnected,
-              ctrl.compensated_trace_half_width, true);
-        } catch (Exception e) {
-          route = null;
+        for (int conn_index = 0; conn_index < conns.size(); conn_index++) {
+          try {
+            round_half_widths[conn_index] = futures.get(conn_index).get();
+          } catch (Exception e) {
+            round_half_widths[conn_index] = 1;
+            round_routes[conn_index] = null;
+          }
         }
+      }
+      for (int conn_index = 0; conn_index < conns.size(); conn_index++) {
+        PartitionRouter.CellRoute route = round_routes[conn_index];
         if (route == null) {
           continue;
         }
-        routes.put(conn, route);
-        int half_width = Math.max(1, ctrl.compensated_trace_half_width[route.layer]);
-        for (FreeSpacePartition.Room room : route.rooms) {
+        routes.put(conns.get(conn_index), route);
+        int half_width = round_half_widths[conn_index];
+        // Terminal rooms (first/last) are exempt from congestion accounting, PathFinder's
+        // source/sink rule: a route cannot avoid its own terminal room, and in the shared
+        // overlay partition a pin-field room is common to EVERY connection starting there
+        // (under the per-net lifted geometry each net saw its own unique terminal rooms, so
+        // this sharing never arose; pricing it just poisons cleanliness without enabling
+        // any reroute).
+        for (int room_index = 1; room_index + 1 < route.rooms.size(); room_index++) {
+          FreeSpacePartition.Room room = route.rooms.get(room_index);
           String key = PartitionRouter.box_key(room.box);
           usage.merge(key, 1, Integer::sum);
           int min_dim = Math.min(room.box.ur.x - room.box.ll.x, room.box.ur.y - room.box.ll.y);
@@ -526,6 +588,11 @@ public class BatchAutorouter extends NamedAlgorithm {
       }
       if (!overuse) {
         break;
+      }
+    }
+    } finally {
+      if (dry_pool != null) {
+        dry_pool.shutdown();
       }
     }
     // Commit phase: winners re-search WITH the final prices through the validated path.
@@ -550,8 +617,9 @@ public class BatchAutorouter extends NamedAlgorithm {
         continue;
       }
       boolean clean = true;
-      for (FreeSpacePartition.Room room : entry.getValue().rooms) {
-        String key = PartitionRouter.box_key(room.box);
+      List<FreeSpacePartition.Room> route_rooms = entry.getValue().rooms;
+      for (int room_index = 1; room_index + 1 < route_rooms.size(); room_index++) {
+        String key = PartitionRouter.box_key(route_rooms.get(room_index).box);
         if (usage.getOrDefault(key, 0) > capacity.getOrDefault(key, 1)) {
           clean = false;
           break;
