@@ -105,5 +105,6 @@ Current router, 20-minute budget, maxThreads=1: fanout escapes 246/303 SMD pins 
 vs 98.4% on the 2-layer fixture); auto-routing reaches pass 5 in the budget at score
 **451.97 / 59 unrouted / 538 violations**, with per-pass wall-clock ~140 s and the
 violation count constant from pass 3 on -- the router cannot repair them. This is the
-number the roadmap exists to move; the 3-isolated-run gate confirmation is the next step
-(runs are ~20 min each), followed by Phase 1.
+number the roadmap exists to move. GATE CONFIRMED: 3 isolated runs produced the identical
+final board (same hash, same 451.97 / 59 / 538) -- fully deterministic. Phase 0 complete;
+Phase 1 (region rules + via spans) is next.
