@@ -88,7 +88,7 @@ public class Issue684MemoryLeakRoutingTest extends RoutingFixtureTest {
 
     Duration duration = completed.getDuration();
     var statsAfter = GetBoardStatistics(completed);
-    IO.println("Issue684 routing test completed in "
+    System.out.println("Issue684 routing test completed in "
         + FRLogger.formatDuration(duration.toSeconds())
         + " with " + statsAfter.connections.incompleteCount + " incomplete connections.");
   }

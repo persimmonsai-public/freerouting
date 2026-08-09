@@ -306,3 +306,12 @@ the parallel router's phase-separation machinery applies); (3) negotiation quali
 -- with only 2 contention-free routes, the round/pricing schedule needs rip-up-style
 iteration (route, price, REROUTE the losers) rather than a single winner-filter, which is
 the v2 negotiation design.
+
+## Negotiation v2 (validated arbitration, no pre-filter): REFUTED on 2-layer (2026-08-09)
+
+Dropping the contention pre-filter and letting the sequential validated commit arbitrate:
+18 commits (vs 8), deterministic 2/2 -- but 984.59/3, below gate. The winner-filter is
+PROTECTIVE: per-commit validation only proves legality, not endgame-compatibility, so the
+10 extra contested commits steal corridors. v1 (winner-filter + long-connection gate,
+989.72/2) stands. The v2 direction for 8-layer congestion remains iterative
+reroute-of-losers WITH the filter, not instead of it.

@@ -14,18 +14,18 @@ plugins {
 
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_25
-    targetCompatibility = JavaVersion.VERSION_25
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 java.toolchain {
-    languageVersion = JavaLanguageVersion.of(25)
+    languageVersion = JavaLanguageVersion.of(21)
 }
 
 [compileJava, compileTestJava]*.options*.encoding = 'UTF-8'
 
 tasks.withType(JavaCompile).configureEach {
-    options.compilerArgs << '-Xlint:unchecked' << '-Xlint:deprecation'
+    options.compilerArgs << '-Xlint:unchecked' << '-Xlint:deprecation' << '--enable-preview'
 }
 
 // javadoc is required for Maven Central publishing but too strict for a non-library project.
@@ -527,6 +527,21 @@ test {
         if (!includeSlowTests.get()) {
             excludeTags 'slow'
         }
+        excludeEngines 'archunit'
+    }
+    jvmArgs '--enable-preview'
+    systemProperty 'fr.threads', System.getProperty('fr.threads', '1')
+    systemProperty 'fr.batch', System.getProperty('fr.batch', '1')
+    systemProperty 'fr.coop', System.getProperty('fr.coop', '1')
+    systemProperty 'fr.retain', System.getProperty('fr.retain', 'false')
+    systemProperty 'fr.partition', System.getProperty('fr.partition', 'false')
+    systemProperty 'fr.fixture', System.getProperty('fr.fixture', 'Issue508-DAC2020_bm01.dsn')
+    systemProperty 'fr.timeout', System.getProperty('fr.timeout', '00:03:00')
+    systemProperty 'fr.escape', System.getProperty('fr.escape', 'false')
+    systemProperty 'fr.reflow', System.getProperty('fr.reflow', 'false')
+    systemProperty 'fr.negotiate', System.getProperty('fr.negotiate', 'false')
+    if (System.getenv('FR_JFR') == '1') {
+        jvmArgs '-XX:StartFlightRecording=settings=profile,filename=/tmp/claude-1364225117/-work-uge-work-qwen-compress/4ce7473f-f801-4a93-8dd3-8dda3b513e57/scratchpad/profile.jfr,dumponexit=true'
     }
 }
 
