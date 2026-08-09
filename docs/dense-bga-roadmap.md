@@ -289,3 +289,20 @@ at +33 s cost; on the 8-layer board dry rounds now require reflow mode for rooms
 Follow-ons: cut the ~70 ms lifted dry-run cost (persistent net overlays), tune
 capacity/pricing to convert more than 8 commits, and the 8-layer reflow-mode negotiation
 measurement.
+
+## Phase 4 opening profile: negotiation at 8-layer scale (2026-08-09)
+
+Reflow-mode negotiation on the 8-layer board (the pour fix works: rooms exist): 153
+connections, 91 routed in the final dry round, but pricing left only **2 contention-free
+candidates and 0 commits** -- 91 routes share a handful of corridors, i.e. the congestion is
+real and extreme, exactly what the board's 56-unrouted difficulty predicts. No regression
+(461.84/56/538 held). Cost: 37.3 s for ~306 lifted dry-runs = **~122 ms per search at
+8-layer scale** (vs ~70 ms at 2 layers).
+
+Phase-4 work items, now with driving numbers: (1) cut the dry-run cost -- persistent net
+overlays instead of lift/rebuild (the 2-layer incremental-maintenance refutation should be
+re-measured here, where economics differ); (2) thread the dry rounds (independent searches;
+the parallel router's phase-separation machinery applies); (3) negotiation quality at scale
+-- with only 2 contention-free routes, the round/pricing schedule needs rip-up-style
+iteration (route, price, REROUTE the losers) rather than a single winner-filter, which is
+the v2 negotiation design.
