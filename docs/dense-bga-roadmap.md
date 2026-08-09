@@ -351,3 +351,15 @@ bottleneck -- the lift -> dirty -> wholesale rebuild cycle is, and persistent ne
 remain Phase 4's single real lever (with deterministic ordering -- sorted contact seeds --
 as a prerequisite noted for that build); (b) any future search change must re-verify
 determinism explicitly, twice now the silent failure mode of this codepath.
+
+## Phase 5 increment 1: detection/reporting layer (2026-08-09)
+
+The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and
+reports the plane census. Measured: the 8-layer board has exactly one pair
+(/Debugger/D+ with D-, matching its USB_DIFF via rule) and 10 planes across all 8 layers,
+all reflowable (get_is_obstacle false -- consistent with the pour-reflow findings); the
+2-layer board has one pair (D+/D-) and no planes. Remaining Phase-5 builds, each
+session-scale: paired routing (route the pair centreline, offset both traces -- the
+partition's windowed channels are a natural substrate since a channel can carry both),
+length matching (meander insertion using the partition's free-space knowledge), and
+return-path reporting over the plane census.

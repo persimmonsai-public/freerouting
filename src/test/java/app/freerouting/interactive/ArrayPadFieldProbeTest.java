@@ -289,6 +289,39 @@ class ArrayPadFieldProbeTest {
       scan_verdicts.merge(comp_name + ":" + verdict, 1, Integer::sum);
     }
     System.out.println("[pad-array] spot-scan verdicts=" + scan_verdicts);
+    // Phase 5 reporting: differential pairs by net-name convention, planes per layer.
+    java.util.Map<String, String> diff_pairs = new java.util.TreeMap<>();
+    for (int n = 1; n <= board.rules.nets.max_net_no(); n++) {
+      var net = board.rules.nets.get(n);
+      if (net == null) {
+        continue;
+      }
+      String name = net.name;
+      String partner = null;
+      if (name.endsWith("_P")) {
+        partner = name.substring(0, name.length() - 2) + "_N";
+      } else if (name.endsWith("+")) {
+        partner = name.substring(0, name.length() - 1) + "-";
+      } else if (name.endsWith("P") && name.length() > 1 && Character.isDigit(name.charAt(name.length() - 2))) {
+        partner = name.substring(0, name.length() - 1) + "N";
+      }
+      if (partner != null && board.rules.nets.get(partner) != null) {
+        diff_pairs.put(name, partner);
+      }
+    }
+    System.out.println("[phase5] diff_pairs=" + diff_pairs);
+    java.util.Map<Integer, Integer> planes_per_layer = new java.util.TreeMap<>();
+    int obstacle_planes = 0;
+    for (Item item : board.get_items()) {
+      if (item instanceof app.freerouting.board.ConductionArea pour) {
+        planes_per_layer.merge(pour.first_layer(), 1, Integer::sum);
+        if (pour.get_is_obstacle()) {
+          ++obstacle_planes;
+        }
+      }
+    }
+    System.out.println("[phase5] planes_per_layer=" + planes_per_layer
+        + " obstacle_planes=" + obstacle_planes);
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width
