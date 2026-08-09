@@ -40,15 +40,18 @@ public final class PartitionRouter {
   public static final class CellRoute {
     public final int layer;
     public final List<FreeSpacePartition.Room> rooms;
+    /** Layer of each room in {@link #rooms}; consecutive entries differing means a via. */
+    public final int[] layers;
     public final Item start_item;
     public final int start_tree_entry_no;
     public final Item target_item;
     public final int target_tree_entry_no;
 
-    CellRoute(int p_layer, List<FreeSpacePartition.Room> p_rooms, Item p_start_item,
+    CellRoute(int p_layer, List<FreeSpacePartition.Room> p_rooms, int[] p_layers, Item p_start_item,
         int p_start_entry, Item p_target_item, int p_target_entry) {
       this.layer = p_layer;
       this.rooms = p_rooms;
+      this.layers = p_layers;
       this.start_item = p_start_item;
       this.start_tree_entry_no = p_start_entry;
       this.target_item = p_target_item;
@@ -128,7 +131,8 @@ public final class PartitionRouter {
    * @param p_half_width per-layer compensated trace half width; a cell border must admit the
    *     full trace width to be traversable
    */
-  public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width) {
+  public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width,
+      int p_via_radius) {
     ensure_fresh();
     // The routing net's own items must not be walls: Locate seeds the destination from the
     // item's CONNECTION shape -- the pad center point for drill items, the centerline for
@@ -155,32 +159,7 @@ public final class PartitionRouter {
       partition.end_bulk();
     }
     try {
-      CellRoute best = null;
-      double best_cost = Double.MAX_VALUE;
-      for (int layer = 0; layer < partitions.length; layer++) {
-        if (partitions[layer] == null) {
-          continue;
-        }
-        CellRoute route = try_route_on_layer(layer, p_start_set, p_dest_set,
-            Math.max(1, p_half_width[layer]));
-        if (route != null) {
-          double cost = route_length(route);
-          // Quality guard: a partition route much longer than the straight terminal distance
-          // is a detour that blocks corridors the endgame needs -- committing such routes was
-          // measured to drop the final score from 994.85/1 to baseline 989.72/2 when the
-          // sentinel fix doubled the raw hit rate. Let the classic engine route those.
-          double direct = center_distance(route.rooms.get(0).box,
-              route.rooms.get(route.rooms.size() - 1).box);
-          if (cost > 1.4 * direct + 20000) {
-            continue;
-          }
-          if (cost < best_cost) {
-            best_cost = cost;
-            best = route;
-          }
-        }
-      }
-      return best;
+      return try_route_multilayer(p_start_set, p_dest_set, p_half_width, p_via_radius);
     } finally {
       // Every attempt is followed by invalidate() from the caller (staleness-vs-quality
       // tradeoff measured in BatchAutorouter), so re-inserting the lifted net into
@@ -197,93 +176,173 @@ public final class PartitionRouter {
     return result;
   }
 
-  private CellRoute try_route_on_layer(int p_layer, Set<Item> p_start_set, Set<Item> p_dest_set,
-      int p_half_width) {
-    FreeSpacePartition partition = partitions[p_layer];
-    // Rooms abutting an item shape, with the shape's tree entry number for door construction.
-    // Both sides require the CONNECTION shape to reach the room: Locate walks toward the
-    // start item's connection shape intersected with the start room (a trace's connection
-    // shape exists only near its endpoints), and an empty intersection makes its target
-    // corner land on the 2^25 sentinel coordinate -- measured as the dominant reject.
-    Map<FreeSpacePartition.Room, ItemContact> starts = contact_rooms(partition, p_start_set, p_layer, p_half_width, true);
-    Map<FreeSpacePartition.Room, ItemContact> targets = contact_rooms(partition, p_dest_set, p_layer, p_half_width, true);
-    if (starts.isEmpty() || targets.isEmpty()) {
-      return null;
-    }
+  /** Extra cost per layer change, discouraging vias a single-layer route can avoid. */
+  private static final double VIA_COST = 200000;
 
-    // A* over the room cover: g = accumulated center distance, h = distance to the nearest
-    // target box. Rooms are overlapping maximal rectangles, so admission is about interiors
-    // and overlaps rather than shared borders:
-    //  - an INTERMEDIATE room must be wide enough in both dimensions for Locate's erosion by
-    //    the compensated half width to leave interior (thin rooms measured to degenerate
-    //    corner placement); start/target rooms are exempt because attachment there is handled
-    //    by the item connection shapes, not by erosion;
-    //  - a transition is passable when the overlap region's LONG dimension hosts the trace
-    //    width (the trace crosses perpendicular to the overlap's thin dimension).
-    int min_pass = 2 * (p_half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
-    List<FreeSpacePartition.Room> rooms = partition.rooms();
-    double[] g = new double[rooms.size()];
-    int[] came_from = new int[rooms.size()];
-    java.util.Arrays.fill(g, Double.MAX_VALUE);
-    java.util.Arrays.fill(came_from, -1);
-    PriorityQueue<double[]> open = new PriorityQueue<>((a, b) -> Double.compare(a[0], b[0]));
-    for (FreeSpacePartition.Room start : starts.keySet()) {
-      // Thin terminal rooms are excluded outright: Locate erodes start/target rooms exactly
-      // like intermediate ones, and a thin terminal degenerates the whole corner walk
-      // (measured: rejected plans' first segments ran ALONG the pin row, clipping the
-      // neighbouring pins over 100k+ units). Better a clean no-route here than degenerate
-      // geometry rejected after realization.
-      if (start.box.ur.x - start.box.ll.x < min_pass || start.box.ur.y - start.box.ll.y < min_pass) {
+  /**
+   * A* over (layer, room) states across all signal layers. Same-layer transitions use the
+   * room-cover admissions; cross-layer transitions are allowed where rooms on the two layers
+   * overlap in a region that can host the via (overlap min-dimension >= via diameter plus
+   * tolerance). Via locations are fixed later, at the joint window in materialize.
+   */
+  private CellRoute try_route_multilayer(Set<Item> p_start_set, Set<Item> p_dest_set,
+      int[] p_half_width, int p_via_radius) {
+    int layer_count = partitions.length;
+    List<List<FreeSpacePartition.Room>> rooms_of = new ArrayList<>(layer_count);
+    int[] offset = new int[layer_count + 1];
+    List<Map<FreeSpacePartition.Room, ItemContact>> starts_of = new ArrayList<>(layer_count);
+    List<Map<FreeSpacePartition.Room, ItemContact>> targets_of = new ArrayList<>(layer_count);
+    int[] min_pass_of = new int[layer_count];
+    boolean any_start = false;
+    boolean any_target = false;
+    for (int layer = 0; layer < layer_count; layer++) {
+      FreeSpacePartition partition = partitions[layer];
+      if (partition == null) {
+        rooms_of.add(List.of());
+        starts_of.add(Map.of());
+        targets_of.add(Map.of());
+        offset[layer + 1] = offset[layer];
         continue;
       }
-      g[start.index] = 0;
-      open.add(new double[]{heuristic(start, targets.keySet()), start.index});
+      int half_width = Math.max(1, p_half_width[layer]);
+      min_pass_of[layer] = 2 * (half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
+      List<FreeSpacePartition.Room> rooms = partition.rooms();
+      rooms_of.add(rooms);
+      offset[layer + 1] = offset[layer] + rooms.size();
+      Map<FreeSpacePartition.Room, ItemContact> starts = contact_rooms(partition, p_start_set, layer, half_width, true);
+      Map<FreeSpacePartition.Room, ItemContact> targets = contact_rooms(partition, p_dest_set, layer, half_width, true);
+      starts_of.add(starts);
+      targets_of.add(targets);
+      any_start |= !starts.isEmpty();
+      any_target |= !targets.isEmpty();
     }
-    FreeSpacePartition.Room reached = null;
-    boolean[] closed = new boolean[rooms.size()];
+    if (!any_start || !any_target) {
+      return null;
+    }
+    int state_count = offset[layer_count];
+    double[] g = new double[state_count];
+    int[] came_from = new int[state_count];
+    boolean[] closed = new boolean[state_count];
+    java.util.Arrays.fill(g, Double.MAX_VALUE);
+    java.util.Arrays.fill(came_from, -1);
+    List<IntBox> target_boxes = new ArrayList<>();
+    for (int layer = 0; layer < layer_count; layer++) {
+      for (FreeSpacePartition.Room room : targets_of.get(layer).keySet()) {
+        target_boxes.add(room.box);
+      }
+    }
+    PriorityQueue<double[]> open = new PriorityQueue<>((a, b) -> Double.compare(a[0], b[0]));
+    for (int layer = 0; layer < layer_count; layer++) {
+      int min_pass = min_pass_of[layer];
+      for (FreeSpacePartition.Room start : starts_of.get(layer).keySet()) {
+        if (start.box.ur.x - start.box.ll.x < min_pass || start.box.ur.y - start.box.ll.y < min_pass) {
+          continue; // thin terminal room: Locate's erosion degenerates (measured)
+        }
+        int id = offset[layer] + start.index;
+        g[id] = 0;
+        open.add(new double[]{box_heuristic(start.box, target_boxes), id});
+      }
+    }
+    int via_pass = 2 * (p_via_radius + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
+    int reached = -1;
     while (!open.isEmpty()) {
       int current = (int) open.poll()[1];
       if (closed[current]) {
         continue;
       }
       closed[current] = true;
-      FreeSpacePartition.Room room = rooms.get(current);
-      if (targets.containsKey(room)) {
-        reached = room;
+      int layer = layer_of(current, offset, layer_count);
+      FreeSpacePartition.Room room = rooms_of.get(layer).get(current - offset[layer]);
+      if (targets_of.get(layer).containsKey(room)) {
+        reached = current;
         break;
       }
-      for (FreeSpacePartition.Room neighbor : partition.room_neighbors(room)) {
-        if (closed[neighbor.index]) {
+      int min_pass = min_pass_of[layer];
+      for (FreeSpacePartition.Room neighbor : partitions[layer].room_neighbors(room)) {
+        int neighbor_id = offset[layer] + neighbor.index;
+        if (closed[neighbor_id]) {
           continue;
         }
         if (neighbor.box.ur.x - neighbor.box.ll.x < min_pass
             || neighbor.box.ur.y - neighbor.box.ll.y < min_pass) {
-          continue; // too thin for Locate's interior erosion (terminal rooms included)
+          continue;
         }
         int dx = Math.min(room.box.ur.x, neighbor.box.ur.x) - Math.max(room.box.ll.x, neighbor.box.ll.x);
         int dy = Math.min(room.box.ur.y, neighbor.box.ur.y) - Math.max(room.box.ll.y, neighbor.box.ll.y);
         if (Math.max(dx, dy) < min_pass) {
-          continue; // the overlap cannot host a trace-wide crossing
+          continue;
         }
         double candidate = g[current] + center_distance(room.box, neighbor.box);
-        if (candidate < g[neighbor.index]) {
-          g[neighbor.index] = candidate;
-          came_from[neighbor.index] = current;
-          open.add(new double[]{candidate + heuristic(neighbor, targets.keySet()), neighbor.index});
+        if (candidate < g[neighbor_id]) {
+          g[neighbor_id] = candidate;
+          came_from[neighbor_id] = current;
+          open.add(new double[]{candidate + box_heuristic(neighbor.box, target_boxes), neighbor_id});
+        }
+      }
+      // Cross-layer transitions: rooms on other layers overlapping enough to host the via.
+      for (int other = 0; other < layer_count; other++) {
+        if (other == layer || partitions[other] == null) {
+          continue;
+        }
+        int other_min_pass = min_pass_of[other];
+        for (FreeSpacePartition.Room via_room : partitions[other].rooms_intersecting(room.box)) {
+          int via_id = offset[other] + via_room.index;
+          if (closed[via_id]) {
+            continue;
+          }
+          if (via_room.box.ur.x - via_room.box.ll.x < other_min_pass
+              || via_room.box.ur.y - via_room.box.ll.y < other_min_pass) {
+            continue;
+          }
+          int dx = Math.min(room.box.ur.x, via_room.box.ur.x) - Math.max(room.box.ll.x, via_room.box.ll.x);
+          int dy = Math.min(room.box.ur.y, via_room.box.ur.y) - Math.max(room.box.ll.y, via_room.box.ll.y);
+          if (Math.min(dx, dy) < via_pass) {
+            continue; // the overlap cannot host the via barrel plus tolerance on both axes
+          }
+          double candidate = g[current] + center_distance(room.box, via_room.box) + VIA_COST;
+          if (candidate < g[via_id]) {
+            g[via_id] = candidate;
+            came_from[via_id] = current;
+            open.add(new double[]{candidate + box_heuristic(via_room.box, target_boxes), via_id});
+          }
         }
       }
     }
-    if (reached == null) {
+    if (reached < 0) {
       return null;
     }
     List<FreeSpacePartition.Room> path = new ArrayList<>();
-    for (int at = reached.index; at != -1; at = came_from[at]) {
-      path.add(0, rooms.get(at));
+    List<Integer> path_layers = new ArrayList<>();
+    for (int at = reached; at != -1; at = came_from[at]) {
+      int layer = layer_of(at, offset, layer_count);
+      path.add(0, rooms_of.get(layer).get(at - offset[layer]));
+      path_layers.add(0, layer);
     }
-    ItemContact start_contact = starts.get(path.get(0));
-    ItemContact target_contact = targets.get(reached);
-    return new CellRoute(p_layer, path, start_contact.item, start_contact.tree_entry_no,
-        target_contact.item, target_contact.tree_entry_no);
+    int[] layers = new int[path_layers.size()];
+    for (int i = 0; i < layers.length; i++) {
+      layers[i] = path_layers.get(i);
+    }
+    ItemContact start_contact = starts_of.get(layers[0]).get(path.get(0));
+    ItemContact target_contact = targets_of.get(layers[layers.length - 1]).get(path.get(path.size() - 1));
+    return new CellRoute(layers[0], path, layers, start_contact.item(), start_contact.tree_entry_no(),
+        target_contact.item(), target_contact.tree_entry_no());
+  }
+
+  private static int layer_of(int p_state, int[] p_offset, int p_layer_count) {
+    for (int layer = p_layer_count - 1; layer >= 0; layer--) {
+      if (p_state >= p_offset[layer]) {
+        return layer;
+      }
+    }
+    return 0;
+  }
+
+  private static double box_heuristic(IntBox p_box, List<IntBox> p_targets) {
+    double best = Double.MAX_VALUE;
+    for (IntBox target : p_targets) {
+      best = Math.min(best, box_distance(p_box, target));
+    }
+    return best;
   }
 
   private record ItemContact(Item item, int tree_entry_no) {
@@ -452,7 +511,7 @@ public final class PartitionRouter {
       if (channel.is_empty()) {
         return null;
       }
-      rooms.add(new CompleteFreeSpaceExpansionRoom(channel, layer, i + 1));
+      rooms.add(new CompleteFreeSpaceExpansionRoom(channel, p_route.layers[i], i + 1));
     }
 
     TargetItemExpansionDoor start_door =
@@ -475,11 +534,29 @@ public final class PartitionRouter {
     // clearance of NEIGHBOURING pads -- the dominant validation failure before this.
     app.freerouting.geometry.planar.FloatPoint aim_from = start_door.get_shape().centre_of_gravity();
     app.freerouting.geometry.planar.FloatPoint aim_to = target_door.get_shape().centre_of_gravity();
-    ExpansionDoor[] doors = new ExpansionDoor[path.size() - 1];
+    ExpandableObject[] doors = new ExpandableObject[path.size() - 1];
     int[] door_section = new int[doors.length];
     for (int i = 0; i < doors.length; i++) {
+      if (p_route.layers[i] != p_route.layers[i + 1]) {
+        // Layer change: an ExpansionDrill at the joint window's centre. Locate ends the
+        // current layer's trace at drill.location and continues on the next layer; Insert
+        // turns the meeting point into a via. room_arr is indexed by absolute layer
+        // (first_layer == 0), matching the backtrack walk's section semantics.
+        int via_radius = Math.max(1, (int) Math.ceil(p_ctrl.max_via_radius));
+        int via_x = (joints[i + 1].ll.x + joints[i + 1].ur.x) / 2;
+        int via_y = (joints[i + 1].ll.y + joints[i + 1].ur.y) / 2;
+        IntBox drill_shape = new IntBox(via_x - via_radius, via_y - via_radius,
+            via_x + via_radius, via_y + via_radius);
+        ExpansionDrill drill = new ExpansionDrill(drill_shape,
+            new app.freerouting.geometry.planar.IntPoint(via_x, via_y), 0, partitions.length - 1);
+        drill.room_arr[p_route.layers[i]] = rooms.get(i);
+        drill.room_arr[p_route.layers[i + 1]] = rooms.get(i + 1);
+        doors[i] = drill;
+        door_section[i] = p_route.layers[i];
+        continue;
+      }
       ExpansionDoor door = new ExpansionDoor(rooms.get(i), rooms.get(i + 1));
-      var sections = door.get_section_segments(half_width);
+      var sections = door.get_section_segments(p_ctrl.compensated_trace_half_width[p_route.layers[i]]);
       if (sections == null || sections.length == 0) {
         return null;
       }

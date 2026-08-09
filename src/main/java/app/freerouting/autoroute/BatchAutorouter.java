@@ -461,7 +461,7 @@ public class BatchAutorouter extends NamedAlgorithm {
         partition_router = new PartitionRouter(board, tree);
       }
       PartitionRouter.CellRoute route = partition_router.try_route(p_start_set, p_dest_set,
-          p_ctrl.compensated_trace_half_width);
+          p_ctrl.compensated_trace_half_width, Math.max(1, (int) Math.ceil(p_ctrl.max_via_radius)));
       if (route == null) {
         ++partition_fallback_count;
         return null;
