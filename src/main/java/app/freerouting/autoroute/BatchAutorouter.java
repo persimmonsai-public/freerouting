@@ -531,7 +531,24 @@ public class BatchAutorouter extends NamedAlgorithm {
     // Commit phase: winners re-search WITH the final prices through the validated path.
     int committed = 0;
     int candidates = 0;
-    for (Map.Entry<NegotiationConn, PartitionRouter.CellRoute> entry : routes.entrySet()) {
+    // Iterate the deterministic connection list, not the identity-hashed map: commit order
+    // changes outcomes (measured: three different final scores across identical runs).
+    for (NegotiationConn conn_key : conns) {
+      PartitionRouter.CellRoute dry_route = routes.get(conn_key);
+      if (dry_route == null) {
+        continue;
+      }
+      Map.Entry<NegotiationConn, PartitionRouter.CellRoute> entry = Map.entry(conn_key, dry_route);
+      // The campaign's measured acceptance lesson applies to negotiation commits too: short
+      // local connections are cheap for the classic engine and their greedy partition
+      // versions fragment endgame corridors. Commit long connections only.
+      var first_room = dry_route.rooms.get(0).box;
+      var last_room = dry_route.rooms.get(dry_route.rooms.size() - 1).box;
+      double span_x = (first_room.ll.x + first_room.ur.x) / 2.0 - (last_room.ll.x + last_room.ur.x) / 2.0;
+      double span_y = (first_room.ll.y + first_room.ur.y) / 2.0 - (last_room.ll.y + last_room.ur.y) / 2.0;
+      if (Math.hypot(span_x, span_y) < 150000) {
+        continue;
+      }
       boolean clean = true;
       for (FreeSpacePartition.Room room : entry.getValue().rooms) {
         String key = PartitionRouter.box_key(room.box);

@@ -267,3 +267,25 @@ correctness -- the ~70 ms lifted search per dry-run is the same per-attempt anat
 profiled in the partition campaign, with the same known levers (persistent net overlays
 instead of lift/rebuild cycles, cheaper heuristics). Tuning capacity/rounds/pricing and
 the 8-layer measurement are the follow-ons.
+
+## Phase 3 v1 hardened: deterministic and gate-clean (2026-08-09)
+
+Three measured corrections landed after the first working version:
+
+1. **Determinism**: the commit phase iterated an identity-hashed map, producing three
+   different final scores across identical runs; committing in the stable connection-list
+   order restored 2/2 reproducibility.
+2. **Acceptance**: the campaign's airline lesson applies to negotiated commits too --
+   restricting commits to long connections (>= 150k terminal span) moved the deterministic
+   outcome from 984.59/3 to **989.72/2 -- exact gate parity, 8 negotiated commits, 2/2
+   identical runs**.
+3. **Partition pour semantics**: passable pours stop being partition walls ONLY in reflow
+   mode (walling them erased all free space on the pour-covered 8-layer board -- zero dry
+   routes; unwalling them without reflow scoring committed corridor-stealing routes,
+   989.72/2 -> 974.34/5).
+
+Standing result: negotiation is deterministic, sound, and gate-parity on the 2-layer board
+at +33 s cost; on the 8-layer board dry rounds now require reflow mode for rooms to exist.
+Follow-ons: cut the ~70 ms lifted dry-run cost (persistent net overlays), tune
+capacity/pricing to convert more than 8 commits, and the 8-layer reflow-mode negotiation
+measurement.

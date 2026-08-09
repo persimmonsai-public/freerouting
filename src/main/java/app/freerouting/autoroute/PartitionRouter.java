@@ -116,6 +116,15 @@ public final class PartitionRouter {
       // (observed as +47 s over a pass once the partition was invalidated per attempt).
       partition.begin_bulk();
       for (Item item : board.get_items()) {
+        if (item instanceof app.freerouting.board.ConductionArea pour && !pour.get_is_obstacle()
+            && app.freerouting.Freerouting.globalSettings != null
+            && app.freerouting.Freerouting.globalSettings.featureFlags.reflowablePours) {
+          // Under pour-reflow modelling only: passable pours stop being partition walls
+          // (walling them erased free space on the pour-covered 8-layer board -- zero dry-run
+          // routes). WITHOUT reflow mode they stay walls: routing through pours then commits
+          // corridor-stealing routes the endgame pays for (measured: 989.72/2 -> 974.34/5).
+          continue;
+        }
         int shape_count = item.tree_shape_count(tree);
         List<TileShape> shapes = null;
         for (int i = 0; i < shape_count; i++) {
