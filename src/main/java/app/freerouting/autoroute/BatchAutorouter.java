@@ -1803,7 +1803,12 @@ public class BatchAutorouter extends NamedAlgorithm {
       // Early passes only: partition successes concentrate where the board is still open
       // (measured: 11 of 12 in pass 1, the rest in pass 2, none later), while every attempt
       // pays the per-attempt freshness cost -- late-pass attempts are pure overhead.
-      if (isPartitionRouterEnabled() && !contains_plane && p_ripup_pass_no <= 1) {
+      // Acceptance policy under test: only LONG connections go to the partition router.
+      // Short local connections are cheap for the classic engine, and their greedy partition
+      // versions were measured to fragment corridors the endgame needs.
+      boolean long_connection = this.air_line != null && this.air_line.a != null
+          && this.air_line.b != null && this.air_line.a.distance(this.air_line.b) >= 150000;
+      if (isPartitionRouterEnabled() && !contains_plane && p_ripup_pass_no <= 1 && long_connection) {
         AutorouteAttemptResult partition_result = try_partition_route(route_start_set, route_dest_set,
             autoroute_control);
         if (partition_result != null) {
