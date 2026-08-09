@@ -396,6 +396,30 @@ winner selection are independent of completion order by construction. Measured o
 The residual is the sequential remainder (connected-set walks feed the pool from the
 submitting loop; per-round A* is already ~3 ms/search).
 
+## Phase 4 item 3: v3 negotiation schedule -- REFUTED; commit bottleneck identified (2026-08-09)
+
+With dry rounds cheap (~0.3 s/round threaded), the v3 schedule hypotheses were finally
+affordable to measure. Both refuted on the 2-layer fixture against the standing
+994.85/1/0 (ROUNDS=8, monotone prices, 3 commits):
+
+- ROUNDS=16 + price decay 0.7/round: 22 clean candidates, 4 committed, **979.47/4**.
+- ROUNDS=16, no decay: 39 clean candidates, 3 committed, **979.47/4**.
+
+More rounds produce MORE clean candidates and WORSE outcomes: the schedule changes which
+connections win, and the 8-round schedule's specific winners are the endgame-compatible
+ones. The recurring campaign lesson (WHICH routes commit is everything) holds against
+schedule sophistication too.
+
+New commit-phase diagnostics (span_rejects / dirty_rejects / already_connected /
+attempt_failures / attempt_drc_rejects in the negotiation log) locate the REAL conversion
+bottleneck on both fixtures: nearly every clean candidate that fails, fails the
+pre-insert DRC check on the MATERIALIZED plan (2-layer: 13 of 17 candidates; 8-layer:
+8 of 8 -- hence 0 commits there). Negotiation pricing finds clean corridors; the
+windowed-channel materialization geometry is what doesn't survive validation. Raising
+the committed count is therefore a materialization-quality problem (channel windows,
+aim lines, corner placement), not a schedule problem -- recorded here as the
+prerequisite for any future negotiation-conversion work.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and

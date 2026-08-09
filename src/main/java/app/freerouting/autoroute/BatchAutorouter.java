@@ -506,6 +506,11 @@ public class BatchAutorouter extends NamedAlgorithm {
     Map<String, Integer> usage = new HashMap<>();
     Map<String, Integer> capacity = new HashMap<>();
     Map<NegotiationConn, PartitionRouter.CellRoute> routes = new HashMap<>();
+    // ROUNDS=8 with monotone prices is the measured champion schedule: 16 rounds scored
+    // 979.47/4 both with and without per-round price decay 0.7 (39 and 22 clean candidates
+    // respectively -- more candidates, worse commits), and decay at 8 rounds was never
+    // reached because both 16-round variants already fell below the 989.72/2 gate. See
+    // docs/dense-bga-roadmap.md, v3 schedule refutation.
     final int ROUNDS = 8;
     final double OVERUSE_PRICE = 50000;
     if (partition_router == null) {
@@ -598,6 +603,11 @@ public class BatchAutorouter extends NamedAlgorithm {
     // Commit phase: winners re-search WITH the final prices through the validated path.
     int committed = 0;
     int candidates = 0;
+    int span_rejects = 0;
+    int dirty_rejects = 0;
+    int already_connected = 0;
+    int attempt_failures = 0;
+    long drc_rejects_before = partition_drc_reject_count;
     // Iterate the deterministic connection list, not the identity-hashed map: commit order
     // changes outcomes (measured: three different final scores across identical runs).
     for (NegotiationConn conn_key : conns) {
@@ -614,6 +624,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       double span_x = (first_room.ll.x + first_room.ur.x) / 2.0 - (last_room.ll.x + last_room.ur.x) / 2.0;
       double span_y = (first_room.ll.y + first_room.ur.y) / 2.0 - (last_room.ll.y + last_room.ur.y) / 2.0;
       if (Math.hypot(span_x, span_y) < 150000) {
+        ++span_rejects;
         continue;
       }
       boolean clean = true;
@@ -626,6 +637,7 @@ public class BatchAutorouter extends NamedAlgorithm {
         }
       }
       if (!clean) {
+        ++dirty_rejects;
         continue;
       }
       ++candidates;
@@ -633,6 +645,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       Set<Item> connected = conn.item().get_connected_set(conn.net_no());
       Set<Item> unconnected = conn.item().get_unconnected_set(conn.net_no());
       if (unconnected.isEmpty()) {
+        ++already_connected;
         continue; // connected as a side effect of an earlier negotiation commit
       }
       AutorouteControl ctrl = new AutorouteControl(this.board, conn.net_no(), settings,
@@ -640,12 +653,17 @@ public class BatchAutorouter extends NamedAlgorithm {
       AutorouteAttemptResult result = try_partition_route(connected, unconnected, ctrl);
       if (result != null && result.state == AutorouteAttemptState.ROUTED) {
         ++committed;
+      } else {
+        ++attempt_failures;
       }
     }
     partition_router.set_room_prices(null);
     job.logInfo("[negotiation] connections=" + conns.size() + " rounds=" + rounds_run
         + " routed_in_final_round=" + routes.size() + " clean_candidates=" + candidates
         + " committed=" + committed
+        + " span_rejects=" + span_rejects + " dirty_rejects=" + dirty_rejects
+        + " already_connected=" + already_connected + " attempt_failures=" + attempt_failures
+        + " attempt_drc_rejects=" + (partition_drc_reject_count - drc_rejects_before)
         + " in " + (System.currentTimeMillis() - t0) + " ms");
   }
   /**
