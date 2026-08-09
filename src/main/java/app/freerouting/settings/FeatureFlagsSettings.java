@@ -59,6 +59,13 @@ public class FeatureFlagsSettings implements Serializable {
    * docs/dense-bga-roadmap.md Phase 2.
    */
   public boolean escapePlanner = false;
+  /**
+   * Pour-reflow modelling: non-obstacle conduction areas (copper pours) are treated as
+   * regenerable -- they stop counting DRC pairs against same-board copper, because the
+   * exporting CAD reflows them with clearance around whatever is routed through them.
+   * Unlocks escapes/routes through pour-covered regions (dense-BGA boards). Default off.
+   */
+  public boolean reflowablePours = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

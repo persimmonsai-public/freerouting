@@ -47,6 +47,7 @@ class ArrayPadFieldProbeTest {
     Freerouting.globalSettings = new GlobalSettings();
     InteractiveSettings.resetForTesting();
     Freerouting.globalSettings.featureFlags.escapePlanner = Boolean.getBoolean("fr.escape");
+    Freerouting.globalSettings.featureFlags.reflowablePours = Boolean.getBoolean("fr.reflow");
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {
       scheduler.jobs.clear();
@@ -178,6 +179,19 @@ class ArrayPadFieldProbeTest {
       raw_violations += item.clearance_violation_count();
     }
     System.out.println("[pad-array] raw_board_violation_count=" + raw_violations);
+    java.util.TreeSet<String> violation_pairs = new java.util.TreeSet<>();
+    for (Item item : board.get_items()) {
+      for (var v : item.clearance_violations()) {
+        int a = item.get_id_no();
+        int b = v.second_item.get_id_no();
+        violation_pairs.add((Math.min(a, b)) + "&" + (Math.max(a, b))
+            + ":" + item.getClass().getSimpleName() + "/" + v.second_item.getClass().getSimpleName());
+      }
+    }
+    System.out.println("[pad-array] pair_count=" + violation_pairs.size());
+    for (String pair : violation_pairs) {
+      System.out.println("[pair] " + pair);
+    }
     // Escape-failure map: SMD pins with a net but no contacts after the fanout stage,
     // grouped by component -- tells Phase 1 exactly where escapes fail.
     Map<String, Integer> unescaped_by_component = new java.util.TreeMap<>();

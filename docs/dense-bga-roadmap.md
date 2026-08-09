@@ -228,3 +228,23 @@ fixture whose escape zones are not pour-covered, or pour-REFLOW modelling (treat
 regenerable: route through them and subtract at export -- how the source CAD behaves).
 Pour-reflow modelling is the newly-discovered real unlock for this class of board and
 joins the roadmap as the successor to the microvia variant.
+
+## Pour-reflow modelling implemented; planner gate-clean (2026-08-09)
+
+`featureFlags.reflowablePours` (default off): non-obstacle conduction areas stop counting
+DRC pairs against same-board copper (ConductionArea overrides) -- the exporting CAD reflows
+them, so nothing routed through them can violate. The planner places inside reflowable
+pours when the flag is on.
+
+The final soundness bug was the ATTACH RULE: Via.is_obstacle has no same-net exemption, so
+a no-attach via must clear even its OWN pad -- all 24 added pairs were planner vias vs
+their own pins (found by pair-diffing two probe runs). With the own-pad check added:
+**17 escapes inserted, zero added violations** (exact baseline 1076/160).
+
+Full run (escape+reflow flags): **461.84 / 56 unrouted / 538 pre-existing violations** --
+equal to the best configuration, gate-clean. Escaped pads do not yet CONVERT to completed
+connections within the 20-minute budget: the escape bottleneck is solved at the placement
+level; conversion is Phase-3 (negotiation / budget) work. Items 1-2 of the feature
+assessment are complete: detection, feasibility (three semantic corrections, all measured),
+span selection (ordered fallback), the planner, and pour-reflow -- each behind flags, each
+validated in both directions.

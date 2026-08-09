@@ -120,7 +120,8 @@ public final class EscapePlanner {
       int cx = (int) center.x + spot[0];
       int cy = (int) center.y + spot[1];
       if (!via_spot_legal(p_board, p_pin, cx, cy, via_radius,
-          padstack.from_layer(), padstack.to_layer(), best_via.get_clearance_class())) {
+          padstack.from_layer(), padstack.to_layer(), best_via.get_clearance_class(),
+          best_via.attach_smd_allowed())) {
         continue;
       }
       IntPoint via_location = new IntPoint(cx, cy);
@@ -154,7 +155,8 @@ public final class EscapePlanner {
   }
 
   private static boolean via_spot_legal(RoutingBoard p_board, Pin p_pin, int p_cx, int p_cy,
-      int p_radius, int p_from_layer, int p_to_layer, int p_clearance_class) {
+      int p_radius, int p_from_layer, int p_to_layer, int p_clearance_class,
+      boolean p_attach_allowed) {
     var tree = p_board.search_tree_manager.get_default_tree();
     IntBox via_box = new IntBox(p_cx - p_radius, p_cy - p_radius, p_cx + p_radius, p_cy + p_radius);
     if (!via_box.is_contained_in(p_board.get_bounding_box())) {
@@ -162,13 +164,27 @@ public final class EscapePlanner {
     }
     for (int layer = p_from_layer; layer <= p_to_layer; layer++) {
       for (var entry : tree.overlapping_tree_entries_with_clearance(via_box, layer, new int[0], p_clearance_class)) {
-        if (!(entry.object instanceof Item blocking) || blocking.shares_net(p_pin)) {
+        if (!(entry.object instanceof Item blocking)) {
           continue;
+        }
+        if (blocking.shares_net(p_pin)) {
+          // Same-net copper is passable EXCEPT pads when the via lacks attach permission:
+          // Via.is_obstacle enforces the attach rule without a same-net exemption, so a
+          // no-attach via too close to its OWN pad is a scored DRC pair (measured: all 24
+          // added pairs were exactly this, planner via vs its own pin).
+          if (!(blocking instanceof Pin) || p_attach_allowed) {
+            continue;
+          }
         }
         // Bidirectional obstacle semantics (measured): a via inside a foreign pour is clean
         // from the via's side but the POUR's directional DRC counts it, and the score counts
-        // the pour's side (+12 scored pairs when this exemption was present). Fanout's own
-        // maze uses is_drill_obstacle and avoids foreign pours; the planner must match.
+        // the pour's side (+12 scored pairs). Under pour-reflow modelling the pour no longer
+        // counts such pairs, so placement inside reflowable pours becomes legal again.
+        if (blocking instanceof ConductionArea pour && !pour.get_is_obstacle()
+            && app.freerouting.Freerouting.globalSettings != null
+            && app.freerouting.Freerouting.globalSettings.featureFlags.reflowablePours) {
+          continue;
+        }
         return false;
       }
     }

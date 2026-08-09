@@ -24,6 +24,28 @@ import java.util.TreeSet;
  */
 public class ConductionArea extends ObstacleArea implements Connectable {
 
+  private boolean reflowable() {
+    return app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.reflowablePours
+        && !get_is_obstacle();
+  }
+
+  @Override
+  public int clearance_violation_count() {
+    if (reflowable()) {
+      return 0; // the pour regenerates around new copper at export; nothing can violate it
+    }
+    return super.clearance_violation_count();
+  }
+
+  @Override
+  public java.util.Collection<app.freerouting.drc.ClearanceViolation> clearance_violations() {
+    if (reflowable()) {
+      return new java.util.LinkedList<>();
+    }
+    return super.clearance_violations();
+  }
+
   private static final double PLANE_FILL_SCALE = 2.5;
   private static final double PLANE_HATCH_OPACITY = 0.85;
   /**
