@@ -113,6 +113,13 @@ class ArrayPadFieldProbeTest {
           + (smd ? " SMD layer=" + sample.first_layer() : " TH"));
     }
 
+    // Violations already present on the (nearly) unrouted board: constant late-pass
+    // violation counts on the 8-layer fixture suggested they might be pre-existing.
+    int raw_violations = 0;
+    for (Item item : board.get_items()) {
+      raw_violations += item.clearance_violation_count();
+    }
+    System.out.println("[pad-array] raw_board_violation_count=" + raw_violations);
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width
