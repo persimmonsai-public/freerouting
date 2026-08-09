@@ -95,3 +95,15 @@ escape stubs are short fixed routes validated by the existing insertability chec
 recurring campaign lesson applies everywhere: the machinery is rarely the blocker; WHICH
 routes commit is — hence gates on every phase and negotiation (Phase 3) as the structural
 answer rather than more hand-tuned acceptance heuristics.
+
+## Phase 0 baseline (measured 2026-08-09)
+
+Fixture `Issue732-RoyalBlue54L-Feather.dsn` (8 layers, 333 pins, U1 = 10x10 BGA at 0.9 mm):
+tests take the fixture via `-Dfr.fixture` and the job budget via `-Dfr.timeout`.
+
+Current router, 20-minute budget, maxThreads=1: fanout escapes 246/303 SMD pins (81.2%,
+vs 98.4% on the 2-layer fixture); auto-routing reaches pass 5 in the budget at score
+**451.97 / 59 unrouted / 538 violations**, with per-pass wall-clock ~140 s and the
+violation count constant from pass 3 on -- the router cannot repair them. This is the
+number the roadmap exists to move; the 3-isolated-run gate confirmation is the next step
+(runs are ~20 min each), followed by Phase 1.

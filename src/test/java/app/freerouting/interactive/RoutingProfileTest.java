@@ -46,12 +46,12 @@ class RoutingProfileTest {
   }
 
   @Test
-  @Timeout(value = 300, unit = TimeUnit.SECONDS)
+  @Timeout(value = 1500, unit = TimeUnit.SECONDS)
   void profileSequentialRouting() {
     TestingSettings settings = new TestingSettings();
     settings.setMaxPasses(8);
     settings.setMaxItems(500);
-    settings.setJobTimeoutString("00:03:00");
+    settings.setJobTimeoutString(System.getProperty("fr.timeout", "00:03:00"));
 
     RoutingJob job = createRoutingJob(FIXTURE, settings);
     job.routerSettings.maxThreads = 1;
