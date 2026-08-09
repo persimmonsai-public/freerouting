@@ -339,14 +339,15 @@ affordable, which is what negotiation quality actually needs).
 
 Every flag defaults off; both fixture gates verified unbroken after every landing.
 
-## Phase 4 increment: O(1) heuristic + ctrl caching (2026-08-09)
+## Phase 4 increment: heuristic experiment -- CORRECTION and refutation (2026-08-09)
 
-The A* heuristic scanned every target room on every edge relax; replaced with the
-admissible O(1) distance-to-target-union-bbox. Per-net AutorouteControl construction in
-negotiation rounds is now cached. Outcome preserved exactly (989.72/2, 8 commits, 2/2
-deterministic) at ~7% less negotiation time (33.6 -> 31.1 s). Verdict: the heuristic was
-NOT the bottleneck -- the ~70 ms lifted dry-run is dominated by the lift -> dirty ->
-wholesale cells+rooms rebuild cycle, which only the persistent-net-overlay build removes.
-That build (query-time own-net transparency instead of physical lifting, with the
-DrillItem pad-centre contact problem solved at contact level) is Phase 4's single
-remaining performance lever, followed by threaded rounds.
+CORRECTION: the previous version of this section claimed a ~7% win from an O(1)
+union-bbox heuristic; the edit had silently failed to apply and the delta was run noise
+on unmodified code. The properly-applied edit measured ~31.4 s (marginal vs 33.6) AND
+reintroduced nondeterminism (7/984.59 vs 8/989.72 across runs): the tie-prone hull
+heuristic exposes identity-ordered HashMap seeding in contact_rooms. REVERTED; the v1
+per-target heuristic stands. Verified verdicts: (a) the heuristic is NOT the dry-run
+bottleneck -- the lift -> dirty -> wholesale rebuild cycle is, and persistent net overlays
+remain Phase 4's single real lever (with deterministic ordering -- sorted contact seeds --
+as a prerequisite noted for that build); (b) any future search change must re-verify
+determinism explicitly, twice now the silent failure mode of this codepath.
