@@ -146,6 +146,9 @@ class ArrayPadFieldProbeTest {
           ++rules_impossible;
         } else {
           ++algorithm_missed;
+          System.out.println("[pad-array] missed pin=" + pin.get_id_no() + " comp=" + name
+              + " center=(" + Math.round(c.x) + "," + Math.round(c.y) + ")"
+              + " interior=" + interior + " net=" + (pin.net_count() > 0 ? pin.get_net_no(0) : -1));
         }
       }
       if (rules_impossible + algorithm_missed > 0) {
