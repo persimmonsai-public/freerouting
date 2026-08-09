@@ -38,7 +38,7 @@ import org.junit.jupiter.api.Timeout;
  */
 class ArrayPadFieldProbeTest {
 
-  private static final String FIXTURE = "Issue508-DAC2020_bm01.dsn";
+  private static final String FIXTURE = System.getProperty("fr.fixture", "Issue508-DAC2020_bm01.dsn");
 
   private RoutingJobScheduler scheduler;
 
