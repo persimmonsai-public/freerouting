@@ -738,8 +738,131 @@ public class BatchAutorouter extends NamedAlgorithm {
         + " span_rejects=" + span_rejects + " dirty_rejects=" + dirty_rejects
         + " already_connected=" + already_connected + " attempt_failures=" + attempt_failures
         + " attempt_drc_rejects=" + (partition_drc_reject_count - drc_rejects_before)
+        + " checked_repairs=" + partition_checked_repair_count
         + " in " + (System.currentTimeMillis() - t0) + " ms");
   }
+  /**
+   * Checked corner placement for a realized partition trace that failed the pre-insert DRC.
+   * The failing tile shape localizes the offending corner (shape i lies between corners i
+   * and i+1); each involved interior corner is retried against a bounded ordered candidate
+   * set, and the WHOLE polyline is re-validated after every candidate, so nothing is
+   * accepted that the board's own insertability predicate would not accept. Candidates, in
+   * order: mirrored dogleg (c' = a + b - c), midpoint straighten, clamp into the plan's
+   * windowed channel box (known-free space), and the channel-clamped projection of c onto
+   * the aim line a->b.
+   *
+   * <p>Distinct from the refuted unconditional repair: only corners that actually fail are
+   * touched, candidates are confined to the plan's own free space, and the pre-insert check
+   * still gates the commit afterwards.
+   */
+  private boolean checked_corner_repair(LocateFoundConnectionAlgo.ResultItem p_trace,
+      AutorouteControl p_ctrl, List<app.freerouting.geometry.planar.IntBox> p_channels) {
+    app.freerouting.geometry.planar.IntPoint[] corners = p_trace.corners;
+    if (corners == null || corners.length < 3) {
+      return false;
+    }
+    int layer = p_trace.layer;
+    int half_width = p_ctrl.trace_half_width[layer];
+    int[] net_arr = new int[]{p_ctrl.net_no};
+    for (int attempt = 0; attempt < 4; attempt++) {
+      int failing_shape;
+      try {
+        failing_shape = board.first_failing_trace_shape(new Polyline(corners), layer, half_width,
+            net_arr, p_ctrl.trace_clearance_class_no);
+      } catch (Exception e) {
+        return false;
+      }
+      if (failing_shape < 0) {
+        ++partition_checked_repair_count;
+        return true;
+      }
+      boolean progressed = false;
+      // Shape i sits between corners i and i+1; only interior corners may move (the
+      // terminals are the attachment points Locate aimed at).
+      for (int k = failing_shape; k <= failing_shape + 1 && !progressed; k++) {
+        if (k < 1 || k + 1 >= corners.length) {
+          continue;
+        }
+        app.freerouting.geometry.planar.IntPoint a = corners[k - 1];
+        app.freerouting.geometry.planar.IntPoint c = corners[k];
+        app.freerouting.geometry.planar.IntPoint b = corners[k + 1];
+        app.freerouting.geometry.planar.IntBox channel = channel_of(p_channels, c);
+        List<app.freerouting.geometry.planar.IntPoint> candidates = new ArrayList<>(4);
+        candidates.add(new app.freerouting.geometry.planar.IntPoint(a.x + b.x - c.x, a.y + b.y - c.y));
+        candidates.add(new app.freerouting.geometry.planar.IntPoint((a.x + b.x) / 2, (a.y + b.y) / 2));
+        if (channel != null) {
+          candidates.add(clamp_into(channel, c));
+          double dx = b.x - (double) a.x;
+          double dy = b.y - (double) a.y;
+          double len_sq = dx * dx + dy * dy;
+          if (len_sq > 0) {
+            double t = ((c.x - (double) a.x) * dx + (c.y - (double) a.y) * dy) / len_sq;
+            t = Math.max(0, Math.min(1, t));
+            candidates.add(clamp_into(channel, new app.freerouting.geometry.planar.IntPoint(
+                (int) Math.round(a.x + t * dx), (int) Math.round(a.y + t * dy))));
+          }
+        }
+        for (app.freerouting.geometry.planar.IntPoint candidate : candidates) {
+          if (candidate.equals(c) || candidate.equals(a) || candidate.equals(b)) {
+            continue;
+          }
+          corners[k] = candidate;
+          int now_failing;
+          try {
+            now_failing = board.first_failing_trace_shape(new Polyline(corners), layer, half_width,
+                net_arr, p_ctrl.trace_clearance_class_no);
+          } catch (Exception e) {
+            now_failing = failing_shape;
+          }
+          if (now_failing < 0) {
+            ++partition_checked_repair_count;
+            return true;
+          }
+          if (now_failing > failing_shape) {
+            progressed = true; // strictly later failure: keep this corner and continue
+            break;
+          }
+          corners[k] = c;
+        }
+      }
+      if (!progressed) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  private static app.freerouting.geometry.planar.IntBox channel_of(
+      List<app.freerouting.geometry.planar.IntBox> p_channels,
+      app.freerouting.geometry.planar.IntPoint p_point) {
+    app.freerouting.geometry.planar.IntBox best = null;
+    double best_distance = Double.MAX_VALUE;
+    for (app.freerouting.geometry.planar.IntBox box : p_channels) {
+      if (p_point.x >= box.ll.x && p_point.x <= box.ur.x
+          && p_point.y >= box.ll.y && p_point.y <= box.ur.y) {
+        return box;
+      }
+      double cx = (box.ll.x + box.ur.x) / 2.0;
+      double cy = (box.ll.y + box.ur.y) / 2.0;
+      double distance = Math.hypot(cx - p_point.x, cy - p_point.y);
+      if (distance < best_distance) {
+        best_distance = distance;
+        best = box;
+      }
+    }
+    return best;
+  }
+
+  private static app.freerouting.geometry.planar.IntPoint clamp_into(
+      app.freerouting.geometry.planar.IntBox p_box,
+      app.freerouting.geometry.planar.IntPoint p_point) {
+    return new app.freerouting.geometry.planar.IntPoint(
+        Math.max(p_box.ll.x, Math.min(p_box.ur.x, p_point.x)),
+        Math.max(p_box.ll.y, Math.min(p_box.ur.y, p_point.y)));
+  }
+
+  private long partition_checked_repair_count;
+
   /**
    * Attempts the connection over the free-space partition. Returns a ROUTED result on success,
    * or null when the classic engine should handle the connection instead (no route found in the
@@ -791,6 +914,11 @@ public class BatchAutorouter extends NamedAlgorithm {
         } catch (Exception e) {
           // Degenerate corner list -- not insertable as planned.
           insertable = false;
+        }
+        if (!insertable && app.freerouting.Freerouting.globalSettings != null
+            && app.freerouting.Freerouting.globalSettings.featureFlags.checkedRealizer) {
+          insertable = checked_corner_repair(located_trace, p_ctrl,
+              partition_router.last_channel_boxes());
         }
         if (!insertable) {
           ++partition_drc_reject_count;

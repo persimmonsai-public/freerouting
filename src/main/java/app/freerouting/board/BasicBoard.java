@@ -1241,6 +1241,26 @@ public class BasicBoard implements Serializable {
   }
 
   /**
+   * Index of the first tile shape of the would-be trace that fails the insertability rules,
+   * or -1 when the whole trace is clean. Same rules as {@link #check_polyline_trace};
+   * shape i lies between polyline corners i and i+1, which is what the checked realizer
+   * needs to know WHICH corner to repair.
+   */
+  public int first_failing_trace_shape(Polyline p_polyline, int p_layer, int p_pen_half_width,
+      int[] p_net_no_arr, int p_clearance_class) {
+    Trace tmp_trace = new PolylineTrace(p_polyline, p_layer, p_pen_half_width, p_net_no_arr,
+        p_clearance_class, 0, 0, FixedState.UNFIXED, this);
+    Set<Pin> contact_pins = tmp_trace.touching_pins_at_end_corners();
+    for (int i = 0; i < tmp_trace.tile_shape_count(); i++) {
+      if (!this.check_trace_shape(tmp_trace.get_tile_shape(i), p_layer, p_net_no_arr,
+          p_clearance_class, contact_pins)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
    * Diagnostic twin of {@link #check_polyline_trace}: walks the same tile shapes with the
    * same obstacle rules and returns a compact description of the FIRST reject (shape
    * position, terminal vs mid, obstacle item and nets), or null when the trace is clean.

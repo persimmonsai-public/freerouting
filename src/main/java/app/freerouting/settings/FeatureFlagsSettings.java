@@ -94,6 +94,15 @@ public class FeatureFlagsSettings implements Serializable {
    * geometric dual emission. Only meaningful with {@link #negotiatedRouter}. Default off.
    */
   public boolean pairCorridorAffinity = false;
+  /**
+   * Checked corner placement for partition-originated plans: when a realized trace fails
+   * the pre-insert DRC, the FAILING corner (located by tile-shape index) is retried against
+   * a bounded ordered candidate set -- mirrored dogleg, midpoint straighten, clamp into the
+   * plan's windowed channel box, and the channel-clamped projection onto the aim line --
+   * with the whole polyline re-validated after each candidate and the pre-insert check
+   * still gating the commit. Only affects partition/negotiation plans. Default off.
+   */
+  public boolean checkedRealizer = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

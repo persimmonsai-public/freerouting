@@ -666,6 +666,98 @@ Regression checks after the detector changes: 2-layer flag-off **989.72/2/0** (e
 baseline), 2-layer negotiation champion **994.85/1/0** with identical counters, bm04
 **979.01/3/0** with the identical unrouted set 2/2.
 
+## Checked corner placement: mechanism works, conversion still loses (2026-08-10)
+
+`featureFlags.checkedRealizer` (-Dfr.checked, default off): when a realized partition plan
+fails the pre-insert DRC, the failing tile shape localizes the offending corner (shape i
+sits between corners i and i+1) and that corner is retried against a bounded ordered
+candidate set -- mirrored dogleg, midpoint straighten, clamp into the plan's windowed
+channel box, and the channel-clamped projection onto the aim line -- with the WHOLE
+polyline re-validated after each candidate (`first_failing_trace_shape`, a new
+index-returning twin of the insertability predicate) and a strict-progress rule (a
+candidate is kept only if the first failure moves strictly later). Unlike the refuted
+unconditional repair, only failing corners are touched and candidates are confined to the
+plan's own known-free space; the pre-insert check still gates the commit.
+
+**The mechanism does what it was asked to do, and the gate still falls:**
+
+| config | rejects | commits | score |
+|---|---|---|---|
+| 2-layer negotiation | 13 -> **7** | 3 -> **4** | 994.85/1 -> **989.72/2** |
+| bm04 negotiation | 3 -> **2** | 0 -> **1** | 979.01/3 -> **972.02/4** |
+| 2-layer partition quality mode | -- | -- | 994.85/1 (parity, inert) |
+| Issue732 escape+reflow+negotiation | 3 -> 3 (0 repairable) | 0 | 465.13/55/538 (parity, inert) |
+
+Both success conditions on rejects and commits are met on both negotiating boards, and on
+both boards **each converted commit costs exactly one routed net**. This is the fourth
+independent measurement of the same law (inline repair, deferred repair, 8-layer repair,
+now channel-confined checked placement): the pre-insert DRC rejection set is not a
+geometry-quality filter that better realization can pass -- it is, empirically, an
+endgame-compatibility filter, and a partition route that displaces a classic-engine route
+in these corridors is worth about one net.
+
+**Failure taxonomy** (the banked deliverable for any future replacement):
+
+1. **Repairable-by-local-move** -- 6 of 13 on 2-layer, 1 of 3 on bm04, 0 of 3 on
+   Issue732. The dogleg excursion leaves the channel and clips a foreign via or pin; any
+   of the four candidate families pulls it back. These are realizer defects, and they are
+   now fixable.
+2. **Unrepairable-in-channel** -- the residual 7 / 2 / 3. No candidate in any of the four
+   families clears the obstacle, which means the obstruction overlaps the channel box
+   INTERIOR, not merely the corner excursion: the partition's room is free in the
+   partition's model but not free for a compensated trace against the live board's tree at
+   that moment (items inserted since the plan was searched, plus clearance compensation
+   the room cover does not model). No corner placement can fix this class -- only a plan
+   whose channels are validated against the live clearance-compensated tree at
+   materialization time.
+3. **Endgame-toxic-but-legal** -- the class the repairs move INTO commits. Legal by
+   construction, validated twice, and still net-negative. Fixing realization does not
+   touch this class; only a commit policy that models corridor opportunity cost would.
+
+Class 2 is the only one where better geometry machinery is the answer, and it needs
+live-tree channel validation rather than corner repair. Class 3 caps what any realizer can
+deliver, which is why the flag stays default off.
+
+## Generalization sweep: are the tuned thresholds general? (2026-08-10)
+
+Flag stack across eight non-gate fixtures, 2-minute budget each, maxItems 500
+(score / unrouted / violations; violations are flag-off pre-existing everywhere -- **no
+flag added a violation on any fixture**):
+
+| fixture | off | partition | escape | negotiate(+negpar) | escape+reflow |
+|---|---|---|---|---|---|
+| DAC2020_bm02 | 999.99/0/0 | = | = (0 escapes) | = (0 commits) | = |
+| DAC2020_bm05 | 831.77/18/0 | **794.39/22** | = (0 escapes) | **822.42/19** (1 commit) | = |
+| DAC2020_bm10 | 999.98/0/0 | 999.99/0 | = (0 escapes) | 999.98/0 (6 commits) | = |
+| DAC2020_bm11 | 981.24/3/0 | **987.49/2** | = (0 escapes) | **987.49/2** (1 commit) | = |
+| CM5_MINIMA_3 | did not converge in 2 min (all configs) | | | | |
+| Issue420-contribution | did not converge in 2 min (all configs) | | | | |
+| caniot-tiny-arm | 495.83/96/4 | = | **501.04/95** (26 escapes) | = (0 commits) | **501.04/95** |
+| ch32v-tx118s | 1000.00/0/0 | = | = (0 escapes) | = | = |
+
+**Verdict, per threshold:**
+
+- **Escape needs filter (150k airline): GENERAL.** It declines on five of six converging
+  fixtures (0 escapes, exact parity) and fires only where long-haul nets exist -- and
+  where it fires it WINS: caniot-tiny-arm gains a net (495.83/96 -> 501.04/95 with 26
+  escapes, violations unchanged), the planner's second independent endgame win after
+  Issue732. A conservative filter that is silent by default and positive when it speaks is
+  the behaviour the campaign wanted.
+- **Negotiation commit policy (150k span + winner filter): BOARD-DEPENDENT, and this
+  refines the earlier reading.** bm11 gains a net from one commit (981.24/3 -> 987.49/2);
+  bm05 LOSES one from one commit (831.77/18 -> 822.42/19); bm10 takes six commits with no
+  change. So "a partition commit costs a net" is not universal -- it is what happens on
+  CONGESTED boards, where committed corridors are contested; where slack exists the same
+  machinery pays. The gate boards are all congested, which is why every previous
+  conversion measurement came out negative.
+- **Partition quality mode: one named regression.** bm05 drops four nets
+  (831.77/18 -> 794.39/22) with no added violations -- the largest flag-off-vs-flag-on
+  regression in the sweep and the clearest bug-shaped result: worth a dedicated diagnosis
+  (bm05 is small and fast, so it is a cheap reproduction case). bm11 conversely gains a
+  net, so the mode is not uniformly harmful.
+- Two fixtures (CM5_MINIMA_3, Issue420-contribution) need more than a 2-minute budget for
+  any configuration; they are size-limited, not failures, and were not diagnosed here.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and

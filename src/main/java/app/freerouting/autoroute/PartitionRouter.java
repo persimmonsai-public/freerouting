@@ -550,14 +550,19 @@ public final class PartitionRouter {
     }
 
     List<CompleteFreeSpaceExpansionRoom> rooms = new ArrayList<>(path.size());
+    List<IntBox> channels = new ArrayList<>(path.size());
     for (int i = 0; i < path.size(); i++) {
       IntBox channel = joints[i].union(joints[i + 1]).offset(channel_margin)
           .intersection(path.get(i).box);
       if (channel.is_empty()) {
         return null;
       }
+      channels.add(channel);
       rooms.add(new CompleteFreeSpaceExpansionRoom(channel, layer, i + 1));
     }
+    // Published for the checked realizer: these boxes are the plan's known-free space, so a
+    // repaired corner that stays inside them stays inside space the partition proved free.
+    this.last_channel_boxes = channels;
 
     TargetItemExpansionDoor start_door =
         new TargetItemExpansionDoor(p_route.start_item, p_route.start_tree_entry_no, rooms.get(0), tree);
@@ -658,6 +663,16 @@ public final class PartitionRouter {
   }
 
   private PadArrayDetector pad_array_detector;
+
+  private List<IntBox> last_channel_boxes = List.of();
+
+  /**
+   * The windowed channel boxes of the most recently materialized plan (same order as its
+   * room path) -- the legal search space for corner repair.
+   */
+  public List<IntBox> last_channel_boxes() {
+    return last_channel_boxes;
+  }
 
   private static double heuristic(FreeSpacePartition.Room p_room, Set<FreeSpacePartition.Room> p_targets) {
     double best = Double.MAX_VALUE;
