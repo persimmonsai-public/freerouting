@@ -579,6 +579,45 @@ Banked as pair corridor affinity v1. Dual offset emission stays ledgered under t
 paired-routing scope; converting the shared corridor into committed pair routes is
 blocked by the same materialization/commit economics as all negotiation conversion.
 
+## DAC2020 16-layer escape benchmarks online (2026-08-09)
+
+The two unused academic escape benchmarks are characterized, gated, and exercised.
+
+**bm04** (Issue508-DAC2020_bm04.dsn, 16 layers): U32 = 65-pin PERIMETER_RING on a 19x19
+5000-pitch footprint (regularity 0.78), U34 = 24-pin ring, 192 SMD pins total; one via
+rule (600:300 um, 6000x6000, full 0-15 span, attach_smd=false), clearance 2000, trace
+half-width 1000; no planes, no diff pairs, **raw board violations 0**. Post-fanout
+unescaped: 39 (U32:31, U34:7, U31:1); spot scan: **35 ESCAPABLE_NOW + 4 ORDERING_VICTIM,
+0 rules-impossible** -- real escape targets, unlike Issue732's rules-starved original.
+
+- Baseline (flag-off, 10-min budget; converges in ~88 s over 8 passes):
+  **979.01 / 3 unrouted / 0 violations, 2/2 identical** -- the standing 16-layer gate.
+- -Dfr.partition: 979.01/3/0 -- parity (+8 s wall).
+- -Dfr.escape: planner inserts 14 dogbones, fanout 157 -> 171/192 (81.8 -> 89.1%) -- its
+  first positive placement yield without reflow -- but final **972.02/4/0, REGRESSION**:
+  the stubs cost one routed net. The campaign law (placement success is not endgame
+  benefit) holds at 16 layers; refuted for this board.
+- -Dfr.negotiate + negpar: 85 connections, 51 in the final dry round, 3 clean candidates,
+  0 commits (all 3 die at the materialization DRC -- the same conversion wall as both
+  other fixtures), negotiation cost 0.9 s, final parity 979.01/3/0.
+- -Dfr.reflow: skipped -- the board has no conduction areas to reflow.
+- Combinations: not justified by the per-flag results (escape regressed; the others are
+  exact parity).
+
+**bm09** (Issue508-DAC2020_bm09.dsn, 16 layers): all THROUGH-HOLE peripheral components
+(U1 2x20, U12 2x8, U32/U33 1x20 lines, 25400 pitch) -- pins span all layers, so there is
+no escape problem at all; no planes, raw violations 0. Baseline **991.38 / 1 / 0 in
+3.9 s** -- essentially solved by the classic engine. Partition: parity. Negotiation: all
+174 connections dry-route, pricing converges in 4 rounds, 6 clean, **1 commit, parity
+held** (991.38/1/0).
+
+Verdict: the machinery is healthy at 16 layers -- overlay negotiation, partition
+materialization, planner, and determinism all behave with zero added violations and no
+new failure modes; the boards themselves are easier than Issue732 (the classic engine
+nearly solves both), so they gate regressions rather than motivate new machinery. The
+negotiation conversion wall (materialization DRC) reproduces here exactly (3/3 rejects),
+now measured on three boards.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and
