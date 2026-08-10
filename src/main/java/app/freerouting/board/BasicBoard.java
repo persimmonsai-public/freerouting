@@ -1241,6 +1241,79 @@ public class BasicBoard implements Serializable {
   }
 
   /**
+   * Diagnostic twin of {@link #check_polyline_trace}: walks the same tile shapes with the
+   * same obstacle rules and returns a compact description of the FIRST reject (shape
+   * position, terminal vs mid, obstacle item and nets), or null when the trace is clean.
+   * Read-only; used by the partition/negotiation reject diagnostics.
+   */
+  public String explain_polyline_trace_reject(Polyline p_polyline, int p_layer, int p_pen_half_width,
+      int[] p_net_no_arr, int p_clearance_class) {
+    Trace tmp_trace = new PolylineTrace(p_polyline, p_layer, p_pen_half_width, p_net_no_arr, p_clearance_class,
+        0, 0, FixedState.UNFIXED, this);
+    Set<Pin> contact_pins = tmp_trace.touching_pins_at_end_corners();
+    int shape_count = tmp_trace.tile_shape_count();
+    for (int i = 0; i < shape_count; i++) {
+      TileShape shape = tmp_trace.get_tile_shape(i);
+      if (!shape.is_contained_in(bounding_box)) {
+        return "shape " + i + "/" + shape_count + " outside board bounds";
+      }
+      ShapeSearchTree default_tree = this.search_tree_manager.get_default_tree();
+      Collection<TreeEntry> tree_entries = new LinkedList<>();
+      int[] ignore_net_nos = new int[0];
+      if (default_tree.is_clearance_compensation_used()) {
+        default_tree.overlapping_tree_entries(shape, p_layer, ignore_net_nos, tree_entries);
+      } else {
+        default_tree.overlapping_tree_entries_with_clearance(shape, p_layer, ignore_net_nos, p_clearance_class,
+            tree_entries);
+      }
+      for (TreeEntry curr_tree_entry : tree_entries) {
+        if (!(curr_tree_entry.object instanceof Item curr_item)) {
+          continue;
+        }
+        String position = (i == 0 ? "FIRST" : i == shape_count - 1 ? "LAST" : "MID");
+        String describe = "shape " + i + "/" + shape_count + " " + position
+            + " at " + shape.centre_of_gravity()
+            + " obstacle=" + curr_item.getClass().getSimpleName() + "#" + curr_item.get_id_no()
+            + " obstacle_net=" + (curr_item.net_count() > 0 ? curr_item.get_net_no(0) : -1)
+            + (curr_item.shares_net_no(p_net_no_arr) ? " SAME_NET" : "");
+        if (contact_pins.contains(curr_item)) {
+          continue;
+        }
+        if (curr_item instanceof Pin) {
+          return describe + " nonContactPin";
+        }
+        boolean is_obstacle = true;
+        for (int k = 0; k < p_net_no_arr.length; k++) {
+          if (!curr_item.is_trace_obstacle(p_net_no_arr[k])) {
+            is_obstacle = false;
+          }
+        }
+        if (is_obstacle && (curr_item instanceof PolylineTrace) && !contact_pins.isEmpty()) {
+          TileShape intersection = null;
+          for (Pin curr_contact_pin : contact_pins) {
+            if (curr_contact_pin.net_count() <= 1 || !curr_contact_pin.shares_net(curr_item)) {
+              continue;
+            }
+            if (intersection == null) {
+              TileShape obstacle_trace_shape = curr_item.get_tile_shape(curr_tree_entry.shape_index_in_object);
+              intersection = shape.intersection(obstacle_trace_shape);
+            }
+            TileShape pin_shape = curr_contact_pin.get_tile_shape_on_layer(p_layer);
+            if (pin_shape.contains_approx(intersection)) {
+              is_obstacle = false;
+              break;
+            }
+          }
+        }
+        if (is_obstacle) {
+          return describe;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
    * Returns the layer count of this board.
    */
   public int get_layer_count() {

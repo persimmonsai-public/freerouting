@@ -657,6 +657,12 @@ public class BatchAutorouter extends NamedAlgorithm {
         ++attempt_failures;
       }
     }
+    // NOTE (measured, both fixtures): retrying the DRC-rejected candidates with the
+    // mirrored-dogleg/straighten repairs converts them mechanically, but every converted
+    // commit was endgame-toxic -- 2-layer 994.85/1 -> 979.47/4 (repair appended AFTER the
+    // untouched winner order), 8-layer 461.84/56 -> 451.97/59 from a single repaired
+    // commit. The pre-insert DRC check is in effect an endgame-compatibility filter; see
+    // docs/dense-bga-roadmap.md (materialization repair refutation).
     partition_router.set_room_prices(null);
     job.logInfo("[negotiation] connections=" + conns.size() + " rounds=" + rounds_run
         + " routed_in_final_round=" + routes.size() + " clean_candidates=" + candidates
@@ -721,6 +727,17 @@ public class BatchAutorouter extends NamedAlgorithm {
         if (!insertable) {
           ++partition_drc_reject_count;
           ++partition_fallback_count;
+          if (isNegotiatedRouterEnabled()) {
+            try {
+              Polyline reject_polyline = new Polyline(located_trace.corners);
+              String reason = board.explain_polyline_trace_reject(reject_polyline, located_trace.layer,
+                  p_ctrl.trace_half_width[located_trace.layer], new int[]{p_ctrl.net_no},
+                  p_ctrl.trace_clearance_class_no);
+              job.logInfo("[materialize-reject] net=" + p_ctrl.net_no + " " + reason);
+            } catch (Exception e) {
+              job.logInfo("[materialize-reject] net=" + p_ctrl.net_no + " degenerate corners");
+            }
+          }
           return null;
         }
       }
@@ -1653,6 +1670,11 @@ public class BatchAutorouter extends NamedAlgorithm {
       FRLogger.traceEntry("BatchAutorouter.autoroute_pass #" + currentPass + " on board '" + currentBoardHash + "'");
 
       continueAutorouting = autoroute_pass(currentPass);
+
+      // NOTE (measured): running the meander matcher after pass 1 as a corridor
+      // reservation inserted ZERO bumps in both runs (pass-1 mismatch 161466, every
+      // candidate failing DRC against the still-messy pass-1 routes) -- final-state
+      // insertion is strictly better; see docs/dense-bga-roadmap.md.
 
       BoardStatistics boardStatisticsAfter = new BoardStatistics(this.board);
       float boardScoreAfter = boardStatisticsAfter.getNormalizedScore(job.routerSettings.scoring);

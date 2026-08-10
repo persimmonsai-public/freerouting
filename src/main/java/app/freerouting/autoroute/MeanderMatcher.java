@@ -80,14 +80,20 @@ public final class MeanderMatcher {
       if (before < MIN_DEFICIT || len_p == 0 || len_n == 0) {
         continue; // matched already, or a member is unrouted -- nothing sound to do
       }
-      String shorter = len_p < len_n ? pair.getKey() : pair.getValue();
       int bumps = 0;
       double deficit = before;
       // Traces this run inserted (SHOVE_FIXED): still legitimate meander candidates for
       // their remaining straight segments, unlike traces fixed by anyone else.
       java.util.Set<Integer> matcher_owned = new java.util.TreeSet<>();
-      // Insert until matched or no candidate segment accepts a meander any more.
+      // Insert until matched or no candidate segment accepts a meander any more. The
+      // SHORTER member is recomputed every iteration and per-call gains are floored to the
+      // remaining deficit: with a fixed member and ceil-rounded gains, a single overshoot
+      // flipped which member was shorter and the loop then LENGTHENED the longer member,
+      // diverging (measured on 8-layer: 37112 -> 43435 across 62 bumps).
       for (int attempt = 0; attempt < 16 && deficit >= MIN_DEFICIT; attempt++) {
+        double len_p_now = net_length(p_board, pair.getKey());
+        double len_n_now = net_length(p_board, pair.getValue());
+        String shorter = len_p_now < len_n_now ? pair.getKey() : pair.getValue();
         int inserted = insert_meander(p_board, shorter, deficit, matcher_owned);
         if (inserted == 0) {
           break;
@@ -133,36 +139,60 @@ public final class MeanderMatcher {
     traces.sort((a, b) -> Integer.compare(a.get_id_no(), b.get_id_no()));
     for (PolylineTrace trace : traces) {
       Polyline polyline = trace.polyline();
-      // Axis-parallel segments of this trace, longest first (deterministic: length then index).
-      List<long[]> segments = new ArrayList<>();
+      // Segments of this trace: axis-parallel (triangle-wave meanders) and perfect 45-degree
+      // diagonals (staircase conversion -- a diagonal run replaced by an x/y staircase adds
+      // (2 - sqrt(2)) of its axial length while deviating at most one step laterally, which
+      // is what a 45-degree-routed board's long runs offer). Deterministic ordering.
+      List<long[]> segments = new ArrayList<>(); // {length_or_axial, index, type 0=axis 1=diag}
       for (int i = 0; i < polyline.corner_count() - 1; i++) {
         Point a = polyline.corner(i);
         Point b = polyline.corner(i + 1);
         IntPoint ai = a.to_float().round();
         IntPoint bi = b.to_float().round();
-        if (ai.x != bi.x && ai.y != bi.y) {
-          continue; // diagonal segment; v1 meanders axis-parallel runs only
+        long adx = Math.abs((long) (bi.x - ai.x));
+        long ady = Math.abs((long) (bi.y - ai.y));
+        if (adx == 0 || ady == 0) {
+          segments.add(new long[]{adx + ady, i, 0});
+        } else if (adx == ady) {
+          segments.add(new long[]{adx, i, 1});
         }
-        long length = Math.abs((long) (bi.x - ai.x)) + Math.abs((long) (bi.y - ai.y));
-        segments.add(new long[]{length, i});
       }
       int half_width = trace.get_half_width();
-      int[] amplitudes = {12 * half_width, 8 * half_width, 5 * half_width, 3 * half_width};
-      // Rank every (segment, amplitude) candidate by the length it can actually add
-      // (bump count limited by both the deficit and the segment's span), best first;
-      // ties resolve by segment index then amplitude, keeping the order deterministic.
-      List<long[]> candidates = new ArrayList<>(); // {achievable_gain, segment_index, amplitude}
+      int[] amplitudes = {12 * half_width, 8 * half_width, 5 * half_width, 3 * half_width, 2 * half_width};
+      // Rank every candidate by the length it can actually add (limited by both the deficit
+      // and the segment's span), best first; ties by segment index then amplitude.
+      List<long[]> candidates = new ArrayList<>(); // {achievable_gain, segment_index, amplitude/step, type}
       for (long[] segment : segments) {
-        for (int amplitude : amplitudes) {
-          long usable = segment[0] - 2L * amplitude;
-          long fits = usable / (3L * amplitude);
-          if (fits <= 0) {
-            continue;
+        if (segment[2] == 0) {
+          for (int amplitude : amplitudes) {
+            long usable = segment[0] - 2L * amplitude;
+            long fits = usable / (3L * amplitude);
+            if (fits <= 0) {
+              continue;
+            }
+            double extra_per_bump = 2 * amplitude * (Math.sqrt(2) - 1);
+            long wanted = (long) Math.floor(p_deficit / extra_per_bump);
+            long gain = (long) (Math.min(fits, wanted) * extra_per_bump);
+            if (gain <= 0) {
+              continue;
+            }
+            candidates.add(new long[]{gain, segment[1], amplitude, 0});
           }
-          double extra_per_bump = 2 * amplitude * (Math.sqrt(2) - 1);
-          long wanted = (long) Math.ceil(p_deficit / extra_per_bump);
-          long gain = (long) (Math.min(fits, wanted) * extra_per_bump);
-          candidates.add(new long[]{gain, segment[1], amplitude});
+        } else {
+          for (int step : new int[]{8 * half_width, 4 * half_width, 2 * half_width}) {
+            long usable = segment[0] - 2L * step;
+            long fits = usable / step;
+            if (fits <= 0) {
+              continue;
+            }
+            double extra_per_step = step * (2 - Math.sqrt(2));
+            long wanted = (long) Math.floor(p_deficit / extra_per_step);
+            long gain = (long) (Math.min(fits, wanted) * extra_per_step);
+            if (gain <= 0) {
+              continue;
+            }
+            candidates.add(new long[]{gain, segment[1], step, 1});
+          }
         }
       }
       candidates.sort((x, y) -> {
@@ -176,8 +206,11 @@ public final class MeanderMatcher {
       });
       for (long[] candidate : candidates) {
         for (int side = 0; side < 2; side++) {
-          int inserted = try_meander_on_segment(p_board, trace, (int) candidate[1],
-              (int) candidate[2], side == 0 ? 1 : -1, p_deficit);
+          int inserted = candidate[3] == 0
+              ? try_meander_on_segment(p_board, trace, (int) candidate[1],
+                  (int) candidate[2], side == 0 ? 1 : -1, p_deficit)
+              : try_staircase_on_segment(p_board, trace, (int) candidate[1],
+                  (int) candidate[2], side == 0, p_deficit);
           if (inserted > 0) {
             if (last_inserted_id >= 0) {
               p_matcher_owned.add(last_inserted_id);
@@ -188,6 +221,55 @@ public final class MeanderMatcher {
       }
     }
     return 0;
+  }
+
+  /**
+   * Staircase conversion of a perfect 45-degree segment: n diagonal steps of p_step become
+   * axis-aligned L-moves (x-first or y-first), each adding p_step * (2 - sqrt(2)) of length
+   * while deviating at most one step from the original centreline. Validated and replaced
+   * exactly like the triangle meander.
+   */
+  private static int try_staircase_on_segment(RoutingBoard p_board, PolylineTrace p_trace,
+      int p_segment_index, int p_step, boolean p_x_first, double p_deficit) {
+    Polyline polyline = p_trace.polyline();
+    IntPoint a = polyline.corner(p_segment_index).to_float().round();
+    IntPoint b = polyline.corner(p_segment_index + 1).to_float().round();
+    int sx = Integer.signum(b.x - a.x);
+    int sy = Integer.signum(b.y - a.y);
+    long axial = Math.abs((long) (b.x - a.x));
+    long margin = p_step;
+    long usable = axial - 2 * margin;
+    long fits = usable / p_step;
+    if (fits <= 0) {
+      return 0;
+    }
+    double extra_per_step = p_step * (2 - Math.sqrt(2));
+    long wanted = (long) Math.floor(p_deficit / extra_per_step);
+    int steps = (int) Math.min(fits, wanted);
+    if (steps <= 0) {
+      return 0;
+    }
+    List<Point> corners = new ArrayList<>();
+    for (int i = 0; i <= p_segment_index; i++) {
+      corners.add(polyline.corner(i));
+    }
+    long cx = a.x + (long) sx * margin;
+    long cy = a.y + (long) sy * margin;
+    corners.add(new IntPoint((int) cx, (int) cy));
+    for (int k = 0; k < steps; k++) {
+      if (p_x_first) {
+        corners.add(new IntPoint((int) (cx + (long) sx * p_step), (int) cy));
+      } else {
+        corners.add(new IntPoint((int) cx, (int) (cy + (long) sy * p_step)));
+      }
+      cx += (long) sx * p_step;
+      cy += (long) sy * p_step;
+      corners.add(new IntPoint((int) cx, (int) cy));
+    }
+    for (int i = p_segment_index + 1; i < polyline.corner_count(); i++) {
+      corners.add(polyline.corner(i));
+    }
+    return validate_and_replace(p_board, p_trace, polyline, corners, steps);
   }
 
   /** Id of the trace created by the most recent successful try_meander_on_segment. */
@@ -215,7 +297,7 @@ public final class MeanderMatcher {
       return 0;
     }
     double extra_per_bump = 2 * p_amplitude * (Math.sqrt(2) - 1);
-    int bumps_wanted = (int) Math.ceil(p_deficit / extra_per_bump);
+    int bumps_wanted = (int) Math.floor(p_deficit / extra_per_bump);
     int bumps = (int) Math.min(bumps_wanted, usable / per_bump_span);
     if (bumps <= 0) {
       return 0;
@@ -241,13 +323,22 @@ public final class MeanderMatcher {
     for (int i = p_segment_index + 1; i < polyline.corner_count(); i++) {
       corners.add(polyline.corner(i));
     }
+    return validate_and_replace(p_board, p_trace, polyline, corners, bumps);
+  }
+
+  /**
+   * Shared tail of both meander shapes: build the polyline, run the board's own DRC, and
+   * replace the trace (SHOVE_FIXED) only when legal; restore the original on insert failure.
+   */
+  private static int validate_and_replace(RoutingBoard p_board, PolylineTrace p_trace,
+      Polyline p_original, List<Point> p_corners, int p_bumps) {
     Polyline meandered;
     try {
-      meandered = new Polyline(corners.toArray(new Point[0]));
+      meandered = new Polyline(p_corners.toArray(new Point[0]));
     } catch (Exception e) {
       return 0; // degenerate corner list
     }
-    if (meandered.corner_count() < corners.size() - 2) {
+    if (meandered.corner_count() < p_corners.size() - 2) {
       return 0; // Polyline collapsed corners; geometry not as planned
     }
     int[] net_no_arr = new int[p_trace.net_count()];
@@ -272,12 +363,12 @@ public final class MeanderMatcher {
         net_no_arr, clearance_class, FixedState.SHOVE_FIXED);
     if (inserted == null) {
       // Restore the original; the removal cannot be left dangling.
-      p_board.insert_trace_without_cleaning(polyline, layer, half_width, net_no_arr,
+      p_board.insert_trace_without_cleaning(p_original, layer, half_width, net_no_arr,
           clearance_class, FixedState.UNFIXED);
       last_inserted_id = -1;
       return 0;
     }
     last_inserted_id = inserted.get_id_no();
-    return bumps;
+    return p_bumps;
   }
 }

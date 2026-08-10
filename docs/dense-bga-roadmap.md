@@ -482,6 +482,59 @@ member's actual pads, (b) a two-polyline offset emission with both sides validat
 session. The windowed-channel substrate and the diff-pair detection (MeanderMatcher.
 detect_pairs) are in place as the starting points.
 
+## Materialization DRC: diagnosed, repair REFUTED both fixtures (2026-08-09)
+
+The reject diagnostics (`BasicBoard.explain_polyline_trace_reject`, a read-only twin of
+`check_polyline_trace` that names the first obstacle; logged as `[materialize-reject]`)
+pinned the mechanism: **all 13 2-layer rejects are MID/LAST tile shapes clipping FOREIGN
+items -- 10 vias, 2 pins, 1 trace** -- Locate's unchecked dogleg corners escaping the
+channel boxes at crossings (inside one box convexity contains the dogleg; between boxes
+it can clip a via just outside).
+
+Repairs were built and work mechanically (mirror the dogleg corner c' = a + b - c;
+straighten a corner to its neighbours' midpoint; every variant re-validated by the full
+DRC before insertion) -- and every conversion was REFUTED by measurement:
+
+- Inline repair (perturbs commit order): 994.85/1 -> 989.72/2.
+- Deferred repair (winners commit untouched first, repairs appended after): converted 1,
+  994.85/1 -> **979.47/4**.
+- 8-layer deferred repair: converted 1, gate 461.84/56/538 -> **451.97/59** -- three nets
+  lost to a single repaired commit.
+
+Verdict: the pre-insert DRC check functions as an endgame-compatibility filter; the
+routes it rejects are precisely the corridor-stealing ones, on both boards. Repair
+machinery removed; the diagnostic layer stays (it is how any future materialization
+work will be measured). Champion re-verified after removal: 994.85/1, 3 commits, 2/2.
+
+## Meander corridor reservation: staircase meanders close the pair (2026-08-09)
+
+Two measured findings replacing the "reserve corridors during routing" hypothesis:
+
+1. Pass-1 insertion (the cheap reservation: meanders claim space early, SHOVE_FIXED
+   reserves it) inserted **ZERO bumps in both runs** -- at pass-1 state the mismatch reads
+   161466 against still-messy routes and every candidate fails DRC. Final-state insertion
+   is strictly better; the pass-1 call was removed.
+2. The real blocker was the v1 axis-parallel restriction: on a 45-degree-routed board the
+   pair's long runs are DIAGONAL. Staircase conversion (a perfect 45-degree run becomes an
+   x/y staircase, adding (2 - sqrt(2)) of its axial length while deviating at most one
+   step) unlocks them.
+
+One real bug caught by the 8-layer measurement: with the shorter member chosen once and
+ceil-rounded gains, a single overshoot flipped which member was shorter and the loop then
+lengthened the LONGER member, diverging (37112 -> 43435 over 62 bumps, gate still held).
+Fixed by flooring per-call gains to the remaining deficit and recomputing the shorter
+member every iteration.
+
+Final results, both gates exact, meanders surviving the optimizer:
+
+- 2-layer: **D+/D- mismatch 43477 -> 448 (33 bumps)** at exactly 989.72/2/0, 2/2
+  identical.
+- 8-layer: **/Debugger/D+ / D- mismatch 37112 -> 204 (39 bumps)** at exactly
+  461.84/56/538, zero added violations.
+
+Both pairs are effectively matched (residuals far below the 2000-unit threshold); the
+"reserve corridors during routing" hypothesis is unnecessary at these fixtures' scale.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and
