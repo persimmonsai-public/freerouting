@@ -1875,6 +1875,19 @@ public class BatchAutorouter extends NamedAlgorithm {
 
     bh.clear();
 
+    if (app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.meanderMatching) {
+      // Phase-5 length matching: runs once, after the routing passes, so meanders are not
+      // ripped by later passes; SHOVE_FIXED insertion protects them from pull-tight.
+      try {
+        for (String line : MeanderMatcher.match(this.board)) {
+          job.logInfo("[meander] " + line);
+        }
+      } catch (Exception e) {
+        job.logError("Meander matching failed", e);
+      }
+    }
+
     // Print all profiling results at the end of session
     PerformanceProfiler.printResults();
     PerformanceProfiler.reset();

@@ -80,6 +80,13 @@ public class FeatureFlagsSettings implements Serializable {
    * order. Default off; only meaningful with {@link #negotiatedRouter}.
    */
   public boolean negotiatedRouterParallelDry = false;
+  /**
+   * Post-route differential-pair length matching by meander insertion (Phase 5): after the
+   * batch autoroute loop, 45-degree triangle meanders are inserted into the shorter member
+   * of each name-convention diff pair, each candidate validated with check_polyline_trace
+   * before replacing the trace (inserted SHOVE_FIXED so pull-tight keeps it). Default off.
+   */
+  public boolean meanderMatching = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

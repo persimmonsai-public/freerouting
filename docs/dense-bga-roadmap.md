@@ -444,6 +444,44 @@ route the board before reporting; default remains load-only) and two reports:
 Both are probe-level (test reporting only, no production code, no flags needed); the
 production DRC-report class remains future work per the phase plan.
 
+## Phase 5 increment 3: meander length matching (2026-08-09)
+
+`featureFlags.meanderMatching` (-Dfr.meander, default off), production class
+`autoroute/MeanderMatcher`, invoked once after the batch routing loop. For each
+name-convention diff pair with routed-length mismatch above 2000 units, 45-degree
+triangle-wave meanders are inserted into straight axis-parallel segments of the shorter
+member: candidates are every (segment, amplitude) combination ranked by the length each
+can actually add, each proposal validated with the board's own `check_polyline_trace`
+before the trace is replaced, and replacements inserted SHOVE_FIXED so pull-tight cannot
+straighten them away (verified: the meander survives the optimization stage). The matcher
+may re-enter its own insertions (remaining straight segments), never traces fixed by
+anyone else. Deterministic throughout (name order, id order, gain-ranked candidates with
+index tie-breaks).
+
+Measured, 2-layer fixture flag-on: **D+/D- mismatch 43477 -> 30223 (2 bumps, 2/2
+identical), final score EXACTLY the 989.72/2/0 gate** -- the added ~1.3 mm of trace does
+not move the score and adds no violations; flag-off re-verified at exact baseline.
+The residual 30223 is honest scarcity: every further (segment, amplitude, side)
+candidate fails DRC validation on this dense board -- closing it needs meanders placed
+during routing (wider corridors reserved up front), not post-hoc insertion.
+
+8-layer fixture flag-on (20-min window; the job itself completes at ~12 min, which the
+meander stage needs -- a 10-min window measured earlier ended the test mid-pass with the
+matcher never reached): **/Debugger/D+ / D- mismatch 37112 -> 23650 (8 bumps), final
+461.84/56/538 -- the exact 8-layer gate, zero added violations.** Both fixtures
+gate-clean with the flag on.
+
+## Phase 5 item 6 (paired routing): scoped, not started (2026-08-09)
+
+Honest scope from this session: routing the pair centreline through the partition's
+windowed channels (the `materialize` machinery) and emitting both offset traces needs
+(a) pair-aware connection selection and terminal fan-in from the centreline to each
+member's actual pads, (b) a two-polyline offset emission with both sides validated,
+(c) commit coordination so a half-committed pair never survives. Each is
+`materialize`-grade geometry work with its own reject modes; together they are a full
+session. The windowed-channel substrate and the diff-pair detection (MeanderMatcher.
+detect_pairs) are in place as the starting points.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and

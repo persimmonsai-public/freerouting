@@ -42,6 +42,7 @@ class RoutingProfileTest {
     Freerouting.globalSettings.featureFlags.reflowablePours = Boolean.getBoolean("fr.reflow");
     Freerouting.globalSettings.featureFlags.negotiatedRouter = Boolean.getBoolean("fr.negotiate");
     Freerouting.globalSettings.featureFlags.negotiatedRouterParallelDry = Boolean.getBoolean("fr.negpar");
+    Freerouting.globalSettings.featureFlags.meanderMatching = Boolean.getBoolean("fr.meander");
     InteractiveSettings.resetForTesting();
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {
