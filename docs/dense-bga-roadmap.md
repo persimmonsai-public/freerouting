@@ -420,6 +420,30 @@ the committed count is therefore a materialization-quality problem (channel wind
 aim lines, corner placement), not a schedule problem -- recorded here as the
 prerequisite for any future negotiation-conversion work.
 
+## Phase 5 increment 2: return-path + length-matching reports (2026-08-09)
+
+The probe gained a ROUTED-board mode (-Dfr.probe_items / -Dfr.probe_passes / -Dfr.timeout
+route the board before reporting; default remains load-only) and two reports:
+
+- **Return-path** ([phase5-return], -Dfr.returnpath_threshold, default 30000 units = 3 mm):
+  every signal via is a layer-change point whose return current must also change reference
+  planes; the report flags signal vias whose nearest same-net or reference-plane via
+  (reference = a via on a net owning ConductionAreas) is farther than the threshold.
+  Measured on the 8-layer microvia board routed to pass 3 (445.39/61 state): 69 signal
+  vias, 10 reference vias, 4 plane nets, **54/69 layer changes are return-path offenders**
+  at 3 mm (worst: Net-(J6-Pin_4) at 15.9 mm) -- the board's return stitching is sparse,
+  consistent with only 10 reference vias for 10 planes. On the plane-less 2-layer board
+  every signal via reports "none" (no reference vias exist) -- the report is
+  structurally correct there but the concept needs planes.
+
+- **Length matching** ([phase5-length]): routed length per net (trace-length sum) and
+  per-diff-pair mismatch. 8-layer pass-3 state: 63 routed nets, the one pair
+  /Debugger/D+ = 336795 vs D- = 373908, **mismatch 37112 units (3.7 mm)** -- a real
+  matching defect a meander pass would need to close.
+
+Both are probe-level (test reporting only, no production code, no flags needed); the
+production DRC-report class remains future work per the phase plan.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and

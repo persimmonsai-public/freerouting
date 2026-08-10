@@ -56,12 +56,15 @@ class ArrayPadFieldProbeTest {
   }
 
   @Test
-  @Timeout(value = 120, unit = TimeUnit.SECONDS)
+  @Timeout(value = 1500, unit = TimeUnit.SECONDS)
   void detectArrayPadFields() {
     TestingSettings settings = new TestingSettings();
-    settings.setMaxPasses(1);
-    settings.setMaxItems(1); // load the board; route (nearly) nothing
-    settings.setJobTimeoutString("00:01:30");
+    // Default: load the board, route (nearly) nothing -- the structural reports. With
+    // -Dfr.probe_items/-Dfr.probe_passes/-Dfr.timeout the probe routes first, which makes
+    // the ROUTED-board reports below (return-path, length matching) meaningful.
+    settings.setMaxPasses(Integer.getInteger("fr.probe_passes", 1));
+    settings.setMaxItems(Integer.getInteger("fr.probe_items", 1));
+    settings.setJobTimeoutString(System.getProperty("fr.timeout", "00:01:30"));
     RoutingJob job = createRoutingJob(FIXTURE, settings);
     job.routerSettings.maxThreads = 1;
     runRoutingJob(job);
@@ -322,6 +325,85 @@ class ArrayPadFieldProbeTest {
     }
     System.out.println("[phase5] planes_per_layer=" + planes_per_layer
         + " obstacle_planes=" + obstacle_planes);
+    // Phase 5 item 4: return-path report. Every signal via is a layer-change point where
+    // the return current must also change reference planes; a healthy design has a same-net
+    // (series/stitching) via or a reference-plane via nearby. Report layer changes whose
+    // nearest such via is farther than the threshold (default 30000 units = 3 mm at the
+    // fixtures' 0.1 um unit).
+    int return_threshold = Integer.getInteger("fr.returnpath_threshold", 30000);
+    java.util.Set<Integer> plane_nets = new java.util.TreeSet<>();
+    for (Item item : board.get_items()) {
+      if (item instanceof app.freerouting.board.ConductionArea pour) {
+        for (int n = 0; n < pour.net_count(); n++) {
+          plane_nets.add(pour.get_net_no(n));
+        }
+      }
+    }
+    List<app.freerouting.board.Via> signal_vias = new ArrayList<>();
+    List<app.freerouting.board.Via> return_vias = new ArrayList<>();
+    for (Item item : board.get_items()) {
+      if (item instanceof app.freerouting.board.Via via && via.net_count() > 0) {
+        if (plane_nets.contains(via.get_net_no(0))) {
+          return_vias.add(via);
+        } else {
+          signal_vias.add(via);
+        }
+      }
+    }
+    int return_offenders = 0;
+    java.util.List<String> worst_offenders = new ArrayList<>();
+    java.util.List<double[]> offender_distances = new ArrayList<>();
+    for (app.freerouting.board.Via via : signal_vias) {
+      var center = via.get_center().to_float();
+      double nearest = Double.MAX_VALUE;
+      for (app.freerouting.board.Via other : signal_vias) {
+        if (other != via && other.get_net_no(0) == via.get_net_no(0)) {
+          var oc = other.get_center().to_float();
+          nearest = Math.min(nearest, Math.hypot(oc.x - center.x, oc.y - center.y));
+        }
+      }
+      for (app.freerouting.board.Via other : return_vias) {
+        var oc = other.get_center().to_float();
+        nearest = Math.min(nearest, Math.hypot(oc.x - center.x, oc.y - center.y));
+      }
+      if (nearest > return_threshold) {
+        ++return_offenders;
+        offender_distances.add(new double[]{nearest, center.x, center.y, via.get_net_no(0)});
+      }
+    }
+    offender_distances.sort((a, b) -> Double.compare(b[0], a[0]));
+    for (int k = 0; k < Math.min(10, offender_distances.size()); k++) {
+      double[] o = offender_distances.get(k);
+      worst_offenders.add(board.rules.nets.get((int) o[3]).name + "@(" + (int) o[1] + ","
+          + (int) o[2] + "):" + (o[0] == Double.MAX_VALUE ? "none" : String.valueOf((int) o[0])));
+    }
+    System.out.println("[phase5-return] signal_vias=" + signal_vias.size()
+        + " reference_vias=" + return_vias.size() + " plane_nets=" + plane_nets.size()
+        + " threshold=" + return_threshold + " offenders=" + return_offenders
+        + " worst=" + worst_offenders);
+    // Phase 5 item 5 (report half): routed length per net and per-diff-pair mismatch.
+    java.util.Map<Integer, Double> net_lengths = new java.util.TreeMap<>();
+    for (Item item : board.get_items()) {
+      if (item instanceof app.freerouting.board.Trace trace && trace.net_count() > 0) {
+        net_lengths.merge(trace.get_net_no(0), trace.get_length(), Double::sum);
+      }
+    }
+    List<String> pair_reports = new ArrayList<>();
+    for (var pair : diff_pairs.entrySet()) {
+      double len_p = 0;
+      double len_n = 0;
+      for (var net : board.rules.nets.get(pair.getKey())) {
+        len_p += net_lengths.getOrDefault(net.net_number, 0.0);
+      }
+      for (var net : board.rules.nets.get(pair.getValue())) {
+        len_n += net_lengths.getOrDefault(net.net_number, 0.0);
+      }
+      pair_reports.add(pair.getKey() + "=" + (long) len_p + " " + pair.getValue() + "="
+          + (long) len_n + " mismatch=" + (long) Math.abs(len_p - len_n));
+    }
+    long routed_nets = net_lengths.size();
+    System.out.println("[phase5-length] routed_nets=" + routed_nets
+        + " diff_pair_mismatch={" + String.join("; ", pair_reports) + "}");
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width
