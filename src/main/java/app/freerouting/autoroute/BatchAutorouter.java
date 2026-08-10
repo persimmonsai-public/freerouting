@@ -469,7 +469,8 @@ public class BatchAutorouter extends NamedAlgorithm {
    * the compensated half width of the found route's layer (1 when no route). Pure reads
    * against the warmed-up partition, so safe to run from the dry pool's worker threads.
    */
-  private int dry_route(NegotiationConn p_conn, PartitionRouter.CellRoute[] p_routes, int p_index) {
+  private int dry_route(NegotiationConn p_conn, PartitionRouter.CellRoute[] p_routes, int p_index,
+      java.util.Set<String> p_partner_room_keys) {
     p_routes[p_index] = null;
     Set<Item> connected = p_conn.item().get_connected_set(p_conn.net_no());
     Set<Item> unconnected = p_conn.item().get_unconnected_set(p_conn.net_no());
@@ -486,12 +487,27 @@ public class BatchAutorouter extends NamedAlgorithm {
       // lift-free mode found zero routes because start contacts required the connection
       // shape inside a room -- the overlay's own-footprint contact rule supplies that.)
       route = partition_router.try_route(connected, unconnected,
-          ctrl.compensated_trace_half_width, false);
+          ctrl.compensated_trace_half_width, false, p_partner_room_keys);
     } catch (Exception e) {
       route = null;
     }
     p_routes[p_index] = route;
     return route == null ? 1 : Math.max(1, ctrl.compensated_trace_half_width[route.layer]);
+  }
+
+  /**
+   * The affinity input for one dry-run: the partner net's previous-round room keys, or
+   * null when affinity is off, the net is not a pair member, or the partner has no route
+   * yet (round 1).
+   */
+  private static java.util.Set<String> partner_keys_for(NegotiationConn p_conn,
+      boolean p_affinity, Map<Integer, Integer> p_pair_partner,
+      Map<Integer, java.util.Set<String>> p_route_keys_by_net) {
+    if (!p_affinity) {
+      return null;
+    }
+    Integer partner = p_pair_partner.get(p_conn.net_no());
+    return partner == null ? null : p_route_keys_by_net.get(partner);
   }
 
   private void run_negotiation(List<Item> p_items) {
@@ -528,6 +544,26 @@ public class BatchAutorouter extends NamedAlgorithm {
     partition_router.warm_up();
     boolean parallel_dry = app.freerouting.Freerouting.globalSettings != null
         && app.freerouting.Freerouting.globalSettings.featureFlags.negotiatedRouterParallelDry;
+    // Pair corridor affinity v1: diff-pair members get a distance discount and price
+    // waiver on their partner's previous-round rooms (flag-gated); the room-overlap
+    // metric below is logged in both modes for the A/B.
+    boolean pair_affinity = app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.pairCorridorAffinity;
+    Map<Integer, Integer> pair_partner = new HashMap<>();
+    for (var pair : MeanderMatcher.detect_pairs(board).entrySet()) {
+      var p_nets = board.rules.nets.get(pair.getKey());
+      var n_nets = board.rules.nets.get(pair.getValue());
+      if (p_nets == null || n_nets == null || p_nets.isEmpty() || n_nets.isEmpty()) {
+        continue;
+      }
+      int p_no = p_nets.iterator().next().net_number;
+      int n_no = n_nets.iterator().next().net_number;
+      pair_partner.put(p_no, n_no);
+      pair_partner.put(n_no, p_no);
+    }
+    // Box keys of each net's previous-round dry route; rebuilt (fresh map) after every
+    // round, so in-flight workers only ever read a completed map.
+    Map<Integer, java.util.Set<String>> route_keys_by_net = new HashMap<>();
     java.util.concurrent.ExecutorService dry_pool = parallel_dry
         ? java.util.concurrent.Executors.newFixedThreadPool(
             Math.min(8, Runtime.getRuntime().availableProcessors()))
@@ -545,13 +581,16 @@ public class BatchAutorouter extends NamedAlgorithm {
       int[] round_half_widths = new int[conns.size()];
       if (dry_pool == null) {
         for (int conn_index = 0; conn_index < conns.size(); conn_index++) {
-          round_half_widths[conn_index] = dry_route(conns.get(conn_index), round_routes, conn_index);
+          round_half_widths[conn_index] = dry_route(conns.get(conn_index), round_routes, conn_index,
+              partner_keys_for(conns.get(conn_index), pair_affinity, pair_partner, route_keys_by_net));
         }
       } else {
         List<java.util.concurrent.Future<Integer>> futures = new ArrayList<>(conns.size());
         for (int conn_index = 0; conn_index < conns.size(); conn_index++) {
           final int fi = conn_index;
-          futures.add(dry_pool.submit(() -> dry_route(conns.get(fi), round_routes, fi)));
+          final java.util.Set<String> partner_keys =
+              partner_keys_for(conns.get(fi), pair_affinity, pair_partner, route_keys_by_net);
+          futures.add(dry_pool.submit(() -> dry_route(conns.get(fi), round_routes, fi, partner_keys)));
         }
         for (int conn_index = 0; conn_index < conns.size(); conn_index++) {
           try {
@@ -583,6 +622,15 @@ public class BatchAutorouter extends NamedAlgorithm {
           capacity.putIfAbsent(key, Math.max(1, min_dim / (6 * half_width)));
         }
       }
+      Map<Integer, java.util.Set<String>> next_keys = new HashMap<>();
+      for (Map.Entry<NegotiationConn, PartitionRouter.CellRoute> routed : routes.entrySet()) {
+        java.util.Set<String> keys = next_keys.computeIfAbsent(routed.getKey().net_no(),
+            k -> new java.util.TreeSet<>());
+        for (FreeSpacePartition.Room room : routed.getValue().rooms) {
+          keys.add(PartitionRouter.box_key(room.box));
+        }
+      }
+      route_keys_by_net = next_keys;
       boolean overuse = false;
       for (Map.Entry<String, Integer> use : usage.entrySet()) {
         int cap = capacity.getOrDefault(use.getKey(), 1);
@@ -599,6 +647,26 @@ public class BatchAutorouter extends NamedAlgorithm {
       if (dry_pool != null) {
         dry_pool.shutdown();
       }
+    }
+    // Pair corridor overlap metric (logged in both affinity modes for the A/B): the
+    // fraction of the smaller member's rooms shared with its partner's route.
+    for (Map.Entry<Integer, Integer> pair : pair_partner.entrySet()) {
+      if (pair.getKey() >= pair.getValue()) {
+        continue; // each pair once
+      }
+      java.util.Set<String> keys_a = route_keys_by_net.get(pair.getKey());
+      java.util.Set<String> keys_b = route_keys_by_net.get(pair.getValue());
+      int shared_count = 0;
+      if (keys_a != null && keys_b != null) {
+        java.util.Set<String> shared = new java.util.TreeSet<>(keys_a);
+        shared.retainAll(keys_b);
+        shared_count = shared.size();
+      }
+      job.logInfo("[pair-affinity] nets=" + pair.getKey() + "/" + pair.getValue()
+          + " affinity=" + pair_affinity
+          + " rooms=" + (keys_a == null ? "none" : keys_a.size())
+          + "/" + (keys_b == null ? "none" : keys_b.size())
+          + " shared=" + shared_count);
     }
     // Commit phase: winners re-search WITH the final prices through the validated path.
     int committed = 0;

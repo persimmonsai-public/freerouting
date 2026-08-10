@@ -43,6 +43,7 @@ class RoutingProfileTest {
     Freerouting.globalSettings.featureFlags.negotiatedRouter = Boolean.getBoolean("fr.negotiate");
     Freerouting.globalSettings.featureFlags.negotiatedRouterParallelDry = Boolean.getBoolean("fr.negpar");
     Freerouting.globalSettings.featureFlags.meanderMatching = Boolean.getBoolean("fr.meander");
+    Freerouting.globalSettings.featureFlags.pairCorridorAffinity = Boolean.getBoolean("fr.pairaffinity");
     InteractiveSettings.resetForTesting();
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {

@@ -188,6 +188,18 @@ public final class PartitionRouter {
    */
   public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width,
       boolean p_lift) {
+    return try_route(p_start_set, p_dest_set, p_half_width, p_lift, null);
+  }
+
+  /**
+   * As above; p_partner_room_keys (nullable) is the pair-corridor affinity input: rooms
+   * whose {@link #box_key} is in the set get a 10 percent distance discount and a full
+   * congestion-price waiver, drawing this member's search toward its differential
+   * partner's corridor. Read-only; deterministic; thread-safe (the set is never mutated
+   * during a round).
+   */
+  public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width,
+      boolean p_lift, Set<String> p_partner_room_keys) {
     ensure_fresh();
     // The routing net's own items must not be walls: Locate seeds the destination from the
     // item's CONNECTION shape -- the pad center point for drill items, the centerline for
@@ -223,7 +235,7 @@ public final class PartitionRouter {
           continue;
         }
         CellRoute route = try_route_on_layer(layer, p_start_set, p_dest_set,
-            Math.max(1, p_half_width[layer]), !p_lift);
+            Math.max(1, p_half_width[layer]), !p_lift, p_partner_room_keys);
         if (route != null) {
           double cost = route_length(route);
           // Quality guard: a partition route much longer than the straight terminal distance
@@ -262,7 +274,7 @@ public final class PartitionRouter {
   }
 
   private CellRoute try_route_on_layer(int p_layer, Set<Item> p_start_set, Set<Item> p_dest_set,
-      int p_half_width, boolean p_own_net_transparent) {
+      int p_half_width, boolean p_own_net_transparent, Set<String> p_partner_room_keys) {
     FreeSpacePartition partition = partitions[p_layer];
     // Rooms abutting an item shape, with the shape's tree entry number for door construction.
     // Both sides require the CONNECTION shape to reach the room: Locate walks toward the
@@ -337,8 +349,11 @@ public final class PartitionRouter {
         if (Math.max(dx, dy) < min_pass) {
           continue; // the overlap cannot host a trace-wide crossing
         }
-        double candidate = g[current] + center_distance(room.box, neighbor.box)
-            + price_of(neighbor.box);
+        boolean partner_room = p_partner_room_keys != null
+            && p_partner_room_keys.contains(box_key(neighbor.box));
+        double candidate = g[current]
+            + center_distance(room.box, neighbor.box) * (partner_room ? 0.9 : 1.0)
+            + (partner_room ? 0 : price_of(neighbor.box));
         if (candidate < g[neighbor.index]) {
           g[neighbor.index] = candidate;
           came_from[neighbor.index] = current;
@@ -471,6 +486,9 @@ public final class PartitionRouter {
     // 100k+-unit maximal rooms the walk drifts and the final legs ran straight down pin
     // columns (measured: the dominant reject signature). Clipping bounds the drift while
     // keeping every shape a subset of known-free space.
+    // NOTE (measured): halving this margin (half_width + tol + 2) did NOT contain the
+    // dogleg-clipping rejects -- 2-layer negotiation rejects went 13 -> 14 and conversions
+    // 3 -> 2 (994.85/1 held by luck of the different trajectory). The 2x margin stands.
     int channel_margin = 2 * (half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE) + 2;
     IntBox[] joints = new IntBox[path.size() + 1];
     // Terminal joints come from the CONNECTION shapes (what Locate actually attaches to),

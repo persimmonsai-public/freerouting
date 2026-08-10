@@ -87,6 +87,13 @@ public class FeatureFlagsSettings implements Serializable {
    * before replacing the trace (inserted SHOVE_FIXED so pull-tight keeps it). Default off.
    */
   public boolean meanderMatching = false;
+  /**
+   * Pair corridor affinity v1 (negotiation dry rounds): a diff-pair member's search gets a
+   * 10 percent distance discount and a congestion-price waiver on rooms of its partner's
+   * previous-round route, drawing the pair through adjacent corridors without any
+   * geometric dual emission. Only meaningful with {@link #negotiatedRouter}. Default off.
+   */
+  public boolean pairCorridorAffinity = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

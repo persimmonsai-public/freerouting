@@ -546,6 +546,39 @@ distance); verified on both fixtures: 2-layer 109 signal vias / 0 reference / 10
 offenders (all "none" -- no planes), 8-layer routed state **69 signal / 10 reference /
 4 plane nets / 54 offenders, worst 159164 units (15.9 mm)** -- exact agreement.
 
+## Channel-tightening experiment: REFUTED (2026-08-09)
+
+The one open geometry avenue after the repair refutation -- contain Locate's doglegs by
+narrowing the windowed channels (channel_margin halved to half_width + tolerance + 2) --
+was measured on the 2-layer negotiation gate: **rejects went UP (13 -> 14) and
+conversions DOWN (3 -> 2)**; the final score stayed 994.85/1 only by the luck of a
+different trajectory. Tighter channels do not contain the crossings; they degrade door
+and window geometry instead. Reverted (2x margin stands, note in the code); champion
+re-verified exactly (994.85/1, 3 commits, 13 rejects). The negotiation-conversion avenue
+via channel geometry is closed with this; better geometry means a different realization
+mechanism, not margin tuning.
+
+## Pair corridor affinity v1 (2026-08-09)
+
+`featureFlags.pairCorridorAffinity` (-Dfr.pairaffinity, default off): in the negotiation
+dry rounds, a diff-pair member's search applies a 10 percent distance discount and a
+congestion-price waiver on rooms of its partner's previous-round route -- corridor
+coupling with NO geometric dual emission (the avenue the repair refutation closed).
+The room-overlap metric ([pair-affinity], logged in both modes) is the A/B instrument.
+
+Measured:
+- 8-layer (both members dry-route): overlap **1 shared room (of 3/9) -> 3 shared
+  (of 6/3) -- the smaller member's corridor becomes 100 percent shared**; one more dry
+  route overall (110 vs 109); commit counts unchanged; **gate exact in both runs
+  (461.84/56/538, zero added violations)**.
+- 2-layer: inert -- D- (net 46) has no dry route in the final round for reachability
+  reasons, so there is no corridor to couple; flag-on is byte-equivalent to flag-off
+  (994.85/1, identical counters, 2/2).
+
+Banked as pair corridor affinity v1. Dual offset emission stays ledgered under the
+paired-routing scope; converting the shared corridor into committed pair routes is
+blocked by the same materialization/commit economics as all negotiation conversion.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and
