@@ -758,6 +758,53 @@ flag added a violation on any fixture**):
 - Two fixtures (CM5_MINIMA_3, Issue420-contribution) need more than a 2-minute budget for
   any configuration; they are size-limited, not failures, and were not diagnosed here.
 
+## Escape quality iteration: board-relative gate replaces the tuned constant (2026-08-10)
+
+**Firing survey** (102 fixtures screened at a 1.5-minute budget with escape+reflow, to
+find where the planner speaks at all): **60 silent, 17 firing, 25 that do not reach the
+planner in that budget**. The firing set is the iteration corpus: Green14SegLED,
+bug-design, Project_GP8B, Board-Unrouted, Protein, smoothieboard, TeamAdapt-LinePCB,
+split05, Issue214-freerouting, caniot-tiny-arm, z10_module, Natural_Tone_Preamp,
+CE2632_HarryMu, CPU-85_r104, tomu-fpga7/8/11. (Escape COUNTS in that survey span code
+versions changed mid-sweep and are indicative only; the per-board airline statistics it
+collected are version-independent and are what the calibration below uses.)
+
+**The tuned constant was indeed fixture-tuned.** 150k means 0.06 to 0.24 of the board
+diagonal across the corpus, so a diagonal fraction cannot reproduce it. Against the MEDIAN
+candidate airline it is nearly invariant on the two boards where escapes pay: 2.09x
+(Issue732) and 2.32x (caniot). But the median alone collapses on boards whose airline
+distribution is degenerate -- Natural_Tone_Preamp has median 2277 against max 269115, so
+2.2x median = 5009, which fired 23 escapes and **regressed the board 637.61/79 ->
+633.02/80**.
+
+**Final rule (both terms required, each measured necessary):**
+`threshold = max(2.2 * median_candidate_airline, 0.15 * board_diagonal)`.
+
+| board | threshold (term that wins) | escapes | result |
+|---|---|---|---|
+| Issue732-microvia | 158064 (median) | 4 | **465.13/55/538 -- win held, 2/2 identical** |
+| caniot-tiny-arm | 145665 (diagonal floor) | 26 | **501.04/95/4 -- win held** |
+| bm04 | 386987 (median; its nets are uniformly short, median 175903 vs max 187085) | 0 | 979.01/3/0 -- exact parity |
+| Natural_Tone_Preamp | 117886 (diagonal floor) | 0 | 637.61/79/0 -- **regression eliminated** |
+
+The bm04 case is the principled version of what the absolute constant achieved by luck:
+that board's nets are all about the same length, so nothing is long-haul relative to the
+board and the planner declines for a stated reason rather than a tuned one.
+
+**Stagger lanes: implemented, verified, neutral.** The earlier "staggered offsets" claim
+was never actually in the code -- nearest-out ordering gives neighbouring pads the SAME
+offset, which is exactly the via wall measured on bm04. Real lane alternation (pins sorted
+by id within a component, alternating near/far outward lane) now exists and is
+deterministic; measured on both wins it changes nothing (Issue732 4 escapes 465.13/55/538,
+caniot 26 escapes 501.04/95). It is insurance against the wall geometry rather than a
+measured gain, kept because it costs nothing.
+
+**Escape planner defaults after this work**: fire when
+`airline >= max(2.2 * median airline, 0.15 * board diagonal)`, place outward along the
+detector's escape axis at the nearest legal spot in the pin's stagger lane. Both terms of
+the gate and the axis direction are now derived from board geometry rather than from
+constants tuned on one fixture.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and

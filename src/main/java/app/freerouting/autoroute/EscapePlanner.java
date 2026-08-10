@@ -63,13 +63,67 @@ public final class EscapePlanner {
         acc[2] += 1;
       }
     }
+    // Threshold calibration data (logged, not yet used): the absolute 150k gate was tuned
+    // on one board, so record the board scale and the candidate airline distribution to
+    // decide whether a board-relative rule reproduces it.
+    var board_box = p_board.get_bounding_box();
+    double board_diagonal = Math.hypot(board_box.ur.x - (double) board_box.ll.x,
+        board_box.ur.y - (double) board_box.ll.y);
+    List<Double> airlines = new ArrayList<>();
+    for (Pin pin : candidates) {
+      double airline = nearest_unconnected_airline(pin);
+      if (airline != Double.MAX_VALUE) {
+        airlines.add(airline);
+      }
+    }
+    airlines.sort(Double::compare);
+    double median_airline = airlines.isEmpty() ? 0
+        : airlines.get(airlines.size() / 2);
+    // Board-relative threshold (measured calibration): the absolute 150k gate corresponds to
+    // wildly different board fractions (0.06 to 0.24 of the diagonal across the corpus), so
+    // the diagonal is the wrong normalizer. Against the MEDIAN candidate airline the tuned
+    // constant is nearly invariant on the two boards where escapes pay -- 2.09x on
+    // Issue732, 2.32x on caniot-tiny-arm -- so that ratio is the scale-free rule.
+    // Two board-relative terms, both required (each alone was measured to fail):
+    //  - the median multiple sets the bar relative to what THIS board's nets look like, but
+    //    collapses on boards whose median airline is near zero (Natural_Tone_Preamp: median
+    //    2277 -> a 5009 gate, 23 escapes, 637.61/79 -> 633.02/80, a measured regression);
+    //  - the diagonal fraction is a scale-free floor that keeps such boards sane, but alone
+    //    it cannot reproduce the tuned behaviour (150k is 0.06 to 0.24 of the diagonal
+    //    across the corpus).
+    double threshold = Math.max(MEDIAN_AIRLINE_MULTIPLE * median_airline,
+        DIAGONAL_FLOOR_FRACTION * board_diagonal);
+    FRLogger.info("[escape-planner] candidates=" + candidates.size()
+        + " board_diagonal=" + (long) board_diagonal
+        + " median_airline=" + (long) median_airline
+        + " max_airline=" + (airlines.isEmpty() ? 0 : (long) (double) airlines.get(airlines.size() - 1))
+        + " threshold=" + (long) threshold
+        + " legacy_threshold=" + NEEDED_AIRLINE
+        + " diagonal_fraction=" + String.format("%.4f", threshold / Math.max(1, board_diagonal)));
+    // Stagger lanes: adjacent pads of one component alternate between a near and a far
+    // outward lane, so their dogbone vias cannot line up into the straight wall measured on
+    // bm04 (four vias at one identical offset along the west channel). Lane assignment is
+    // deterministic -- pins sorted by id within their component.
+    java.util.Map<Integer, Integer> stagger_lane = new java.util.HashMap<>();
+    java.util.Map<Integer, List<Pin>> by_component = new java.util.TreeMap<>();
+    for (Pin pin : candidates) {
+      by_component.computeIfAbsent(pin.get_component_no(), k -> new ArrayList<>()).add(pin);
+    }
+    for (var entry : by_component.entrySet()) {
+      List<Pin> component_pins = entry.getValue();
+      component_pins.sort((a, b) -> Integer.compare(a.get_id_no(), b.get_id_no()));
+      for (int i = 0; i < component_pins.size(); i++) {
+        stagger_lane.put(component_pins.get(i).get_id_no(), i % 2);
+      }
+    }
     List<Item> planned_items = new ArrayList<>();
     for (Pin pin : candidates) {
-      if (!escape_needed(p_board, pin)) {
+      if (!escape_needed(pin, threshold)) {
         continue;
       }
       if (plan_one(p_board, pin, planned_items, detector,
-          component_centroids.get(pin.get_component_no()))) {
+          component_centroids.get(pin.get_component_no()),
+          stagger_lane.getOrDefault(pin.get_id_no(), 0))) {
         ++inserted;
       }
     }
@@ -96,8 +150,28 @@ public final class EscapePlanner {
    * same-net item must reach the campaign's long-connection threshold.
    */
   private static final int NEEDED_AIRLINE = 150000;
+  /**
+   * Board-relative escape gate: a pin needs an escape when its airline is this multiple of
+   * the board's median candidate airline. Calibrated (not guessed) from the two boards
+   * where escapes pay -- the tuned 150k constant equals 2.09x median there and 2.32x on
+   * caniot-tiny-arm -- and it makes the rule scale-free instead of fixture-tuned.
+   */
+  private static final double MEDIAN_AIRLINE_MULTIPLE = 2.2;
+  /**
+   * Scale-free floor under the median rule: a pin never counts as long-haul below this
+   * fraction of the board diagonal. Calibrated so the two escape wins keep their placements
+   * (Issue732 keeps the median term at 158064; caniot lands at 145666, both firing as
+   * before) while degenerate-median boards stop over-firing.
+   */
+  private static final double DIAGONAL_FLOOR_FRACTION = 0.15;
 
-  private static boolean escape_needed(RoutingBoard p_board, Pin p_pin) {
+  private static boolean escape_needed(Pin p_pin, double p_threshold) {
+    double nearest = nearest_unconnected_airline(p_pin);
+    return nearest != Double.MAX_VALUE && nearest >= p_threshold;
+  }
+
+  /** Distance to the nearest unconnected same-net item, or MAX_VALUE when there is none. */
+  private static double nearest_unconnected_airline(Pin p_pin) {
     FloatPoint center = p_pin.get_center().to_float();
     double nearest = Double.MAX_VALUE;
     for (Item other : p_pin.get_unconnected_set(p_pin.get_net_no(0))) {
@@ -113,11 +187,11 @@ public final class EscapePlanner {
       }
       nearest = Math.min(nearest, Math.hypot(other_center.x - center.x, other_center.y - center.y));
     }
-    return nearest != Double.MAX_VALUE && nearest >= NEEDED_AIRLINE;
+    return nearest;
   }
 
   private static boolean plan_one(RoutingBoard p_board, Pin p_pin, List<Item> p_inserted,
-      PadArrayDetector p_detector, double[] p_centroid) {
+      PadArrayDetector p_detector, double[] p_centroid, int p_stagger_lane) {
     int layer = p_pin.first_layer();
     int net = p_pin.get_net_no(0);
     // Smallest via whose span covers the pin's layer.
@@ -187,12 +261,21 @@ public final class EscapePlanner {
           (long) a[0] * a[0] + (long) a[1] * a[1],
           (long) b[0] * b[0] + (long) b[1] * b[1]));
     } else {
+      final long lane_boundary = (long) step * 2;
       spots.sort((a, b) -> {
         long proj_a = (long) a[0] * ax + (long) a[1] * ay;
         long proj_b = (long) b[0] * ax + (long) b[1] * ay;
         int outward = Boolean.compare(proj_a <= 0, proj_b <= 0); // outward (proj > 0) first
         if (outward != 0) {
           return outward;
+        }
+        // Preferred lane first (near lane for even pins, far lane for odd), so neighbouring
+        // pads of one component do not settle at the same outward distance.
+        boolean far_a = proj_a > lane_boundary;
+        boolean far_b = proj_b > lane_boundary;
+        boolean want_far = p_stagger_lane == 1;
+        if (far_a != far_b) {
+          return far_a == want_far ? -1 : 1;
         }
         long perp_a = Math.abs((long) a[0] * -ay + (long) a[1] * ax);
         long perp_b = Math.abs((long) b[0] * -ay + (long) b[1] * ax);
