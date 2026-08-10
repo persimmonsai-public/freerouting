@@ -381,6 +381,25 @@ class ArrayPadFieldProbeTest {
         + " reference_vias=" + return_vias.size() + " plane_nets=" + plane_nets.size()
         + " threshold=" + return_threshold + " offenders=" + return_offenders
         + " worst=" + worst_offenders);
+    // The production report class must reproduce the probe-level numbers exactly.
+    var production_report = app.freerouting.drc.ReturnPathReport.analyze(board, return_threshold);
+    org.junit.jupiter.api.Assertions.assertEquals(signal_vias.size(), production_report.signal_via_count(),
+        "production signal via count");
+    org.junit.jupiter.api.Assertions.assertEquals(return_vias.size(), production_report.reference_via_count(),
+        "production reference via count");
+    org.junit.jupiter.api.Assertions.assertEquals(plane_nets.size(), production_report.plane_net_count(),
+        "production plane net count");
+    org.junit.jupiter.api.Assertions.assertEquals(return_offenders, production_report.findings().size(),
+        "production offender count");
+    if (!offender_distances.isEmpty()) {
+      double inline_worst = offender_distances.get(0)[0] == Double.MAX_VALUE
+          ? Double.POSITIVE_INFINITY : offender_distances.get(0)[0];
+      org.junit.jupiter.api.Assertions.assertEquals(inline_worst,
+          production_report.findings().get(0).nearest_return_distance(), 1e-6,
+          "production worst offender distance");
+    }
+    System.out.println("[phase5-return-drc] production class agrees: findings="
+        + production_report.findings().size());
     // Phase 5 item 5 (report half): routed length per net and per-diff-pair mismatch.
     java.util.Map<Integer, Double> net_lengths = new java.util.TreeMap<>();
     for (Item item : board.get_items()) {

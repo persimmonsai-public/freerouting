@@ -535,6 +535,17 @@ Final results, both gates exact, meanders surviving the optimizer:
 Both pairs are effectively matched (residuals far below the 2000-unit threshold); the
 "reserve corridors during routing" hypothesis is unnecessary at these fixtures' scale.
 
+## Phase 5: production return-path report class (2026-08-09)
+
+`app.freerouting.drc.ReturnPathReport` graduates the probe's [phase5-return] report:
+`analyze(board, threshold)` returns structured findings (via id/net/centre/layer span/
+distance to nearest same-net or reference-plane via), offenders only, worst-first,
+deterministic, read-only -- no participation in routing or scoring, so no flag. The probe
+now asserts the production class against its own inline computation (counts and worst
+distance); verified on both fixtures: 2-layer 109 signal vias / 0 reference / 109
+offenders (all "none" -- no planes), 8-layer routed state **69 signal / 10 reference /
+4 plane nets / 54 offenders, worst 159164 units (15.9 mm)** -- exact agreement.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and
