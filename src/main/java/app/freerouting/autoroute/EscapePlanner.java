@@ -46,9 +46,30 @@ public final class EscapePlanner {
         candidates.add(pin);
       }
     }
+    // Escape-axis inputs (bm04 diagnosis): nearest-legal-spot placement put ~half the
+    // dogbones ALONG the pad rows -- into the very ring channels the endgame needs
+    // (972.02/4 vs the 979.01/3 baseline). The detector's per-pad axis plus the component
+    // centroid (for the outward sign on unsigned ring axes) orders candidates
+    // outward-along-axis first instead.
+    PadArrayDetector detector = new PadArrayDetector(p_board);
+    java.util.Map<Integer, double[]> component_centroids = new java.util.HashMap<>();
+    for (Item item : p_board.get_items()) {
+      if (item instanceof Pin pin) {
+        double[] acc = component_centroids.computeIfAbsent(pin.get_component_no(),
+            k -> new double[3]);
+        FloatPoint pin_center = pin.get_center().to_float();
+        acc[0] += pin_center.x;
+        acc[1] += pin_center.y;
+        acc[2] += 1;
+      }
+    }
     List<Item> planned_items = new ArrayList<>();
     for (Pin pin : candidates) {
-      if (plan_one(p_board, pin, planned_items)) {
+      if (!escape_needed(p_board, pin)) {
+        continue;
+      }
+      if (plan_one(p_board, pin, planned_items, detector,
+          component_centroids.get(pin.get_component_no()))) {
         ++inserted;
       }
     }
@@ -66,7 +87,37 @@ public final class EscapePlanner {
     return inserted;
   }
 
-  private static boolean plan_one(RoutingBoard p_board, Pin p_pin, List<Item> p_inserted) {
+  /**
+   * The needs filter (bm04 diagnosis): every one of the planner's escapes there served a
+   * net the classic engine routes fine on the surface, and each cost a full-span via --
+   * the escaped board lost a net (972.02/4 vs 979.01/3) with ZERO of the escapes going to
+   * the hard nets. A pin needs an escape only when its connection is long enough that
+   * surface routing from the pad is at risk: the airline to the nearest unconnected
+   * same-net item must reach the campaign's long-connection threshold.
+   */
+  private static final int NEEDED_AIRLINE = 150000;
+
+  private static boolean escape_needed(RoutingBoard p_board, Pin p_pin) {
+    FloatPoint center = p_pin.get_center().to_float();
+    double nearest = Double.MAX_VALUE;
+    for (Item other : p_pin.get_unconnected_set(p_pin.get_net_no(0))) {
+      if (other instanceof ConductionArea) {
+        continue; // reflowable planes reach everywhere; not a routing target distance
+      }
+      FloatPoint other_center;
+      if (other instanceof app.freerouting.board.DrillItem drill) {
+        other_center = drill.get_center().to_float();
+      } else {
+        var box = other.bounding_box();
+        other_center = new FloatPoint((box.ll.x + box.ur.x) / 2.0, (box.ll.y + box.ur.y) / 2.0);
+      }
+      nearest = Math.min(nearest, Math.hypot(other_center.x - center.x, other_center.y - center.y));
+    }
+    return nearest != Double.MAX_VALUE && nearest >= NEEDED_AIRLINE;
+  }
+
+  private static boolean plan_one(RoutingBoard p_board, Pin p_pin, List<Item> p_inserted,
+      PadArrayDetector p_detector, double[] p_centroid) {
     int layer = p_pin.first_layer();
     int net = p_pin.get_net_no(0);
     // Smallest via whose span covers the pin's layer.
@@ -103,7 +154,6 @@ public final class EscapePlanner {
     int reach = 3 * pitch_guess;
     int step = Math.max(500, pitch_guess / 4);
 
-    // Candidates nearest-first.
     List<int[]> spots = new ArrayList<>();
     for (int dx = -reach; dx <= reach; dx += step) {
       for (int dy = -reach; dy <= reach; dy += step) {
@@ -112,9 +162,49 @@ public final class EscapePlanner {
         }
       }
     }
-    spots.sort((a, b) -> Long.compare(
-        (long) a[0] * a[0] + (long) a[1] * a[1],
-        (long) b[0] * b[0] + (long) b[1] * b[1]));
+    // Candidate order: outward along the detector's escape axis first (outward half-plane,
+    // then smallest perpendicular offset from the axis, then nearest); plain nearest-first
+    // when the pad has no detected axis.
+    PadArrayDetector.PadEscape escape = p_detector == null ? null : p_detector.escape_of(p_pin);
+    int axis_x = 0;
+    int axis_y = 0;
+    if (escape != null && (escape.axis_x() != 0 || escape.axis_y() != 0)) {
+      axis_x = escape.axis_x();
+      axis_y = escape.axis_y();
+      if (!escape.signed() && p_centroid != null && p_centroid[2] > 0) {
+        double out_x = center.x - p_centroid[0] / p_centroid[2];
+        double out_y = center.y - p_centroid[1] / p_centroid[2];
+        if (axis_x * out_x + axis_y * out_y < 0) {
+          axis_x = -axis_x;
+          axis_y = -axis_y;
+        }
+      }
+    }
+    final int ax = axis_x;
+    final int ay = axis_y;
+    if (ax == 0 && ay == 0) {
+      spots.sort((a, b) -> Long.compare(
+          (long) a[0] * a[0] + (long) a[1] * a[1],
+          (long) b[0] * b[0] + (long) b[1] * b[1]));
+    } else {
+      spots.sort((a, b) -> {
+        long proj_a = (long) a[0] * ax + (long) a[1] * ay;
+        long proj_b = (long) b[0] * ax + (long) b[1] * ay;
+        int outward = Boolean.compare(proj_a <= 0, proj_b <= 0); // outward (proj > 0) first
+        if (outward != 0) {
+          return outward;
+        }
+        long perp_a = Math.abs((long) a[0] * -ay + (long) a[1] * ax);
+        long perp_b = Math.abs((long) b[0] * -ay + (long) b[1] * ax);
+        if (perp_a != perp_b) {
+          return Long.compare(perp_a, perp_b);
+        }
+        // Nearest out (measured: farthest-out scored 965.03/5 vs 972.02/4 -- the longer
+        // stubs consume more corridor than the via wall they avoid).
+        return Long.compare((long) a[0] * a[0] + (long) a[1] * a[1],
+            (long) b[0] * b[0] + (long) b[1] * b[1]);
+      });
+    }
 
     for (int[] spot : spots) {
       int cx = (int) center.x + spot[0];
@@ -137,6 +227,9 @@ public final class EscapePlanner {
       if (!stub_legal) {
         continue;
       }
+      FRLogger.info("[escape-planner] escape pin=" + p_pin.get_id_no() + " net=" + net
+          + " pad=(" + (int) center.x + "," + (int) center.y + ")"
+          + " via=(" + cx + "," + cy + ") offset=(" + spot[0] + "," + spot[1] + ")");
       var via_item = p_board.insert_via(padstack, via_location, new int[]{net},
           best_via.get_clearance_class(), FixedState.UNFIXED, best_via.attach_smd_allowed());
       var stub_item = p_board.insert_trace_without_cleaning(stub, layer, half_width, new int[]{net},

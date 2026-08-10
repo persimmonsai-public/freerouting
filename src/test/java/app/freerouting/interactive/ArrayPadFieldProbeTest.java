@@ -423,6 +423,19 @@ class ArrayPadFieldProbeTest {
     long routed_nets = net_lengths.size();
     System.out.println("[phase5-length] routed_nets=" + routed_nets
         + " diff_pair_mismatch={" + String.join("; ", pair_reports) + "}");
+    // Per-net unrouted report for A/B diagnosis of the routed state.
+    var incompletes_drc = new app.freerouting.drc.DesignRulesChecker(board, null);
+    incompletes_drc.calculateAllIncompletes();
+    java.util.List<String> unrouted_nets = new ArrayList<>();
+    for (int n = 1; n <= board.rules.nets.max_net_no(); n++) {
+      int incomplete_count = incompletes_drc.getIncompleteCount(n);
+      if (incomplete_count > 0) {
+        var net = board.rules.nets.get(n);
+        unrouted_nets.add((net == null ? "net#" + n : net.name) + "(#" + n + ")x" + incomplete_count);
+      }
+    }
+    System.out.println("[probe-unrouted] count=" + incompletes_drc.getIncompleteCount()
+        + " nets=" + unrouted_nets);
     // Board-level context an escape planner needs.
     int default_half_width = board.rules.get_default_net_class().get_trace_half_width(0);
     System.out.println("[pad-array] default_trace_half_width=" + default_half_width

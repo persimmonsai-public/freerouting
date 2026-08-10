@@ -146,8 +146,11 @@ public final class PadArrayDetector {
     List<Double> xs = cluster(xs_sorted);
     List<Double> ys = cluster(ys_sorted);
     double regularity = Math.min(delta_regularity(xs), delta_regularity(ys));
-    if (regularity < 0.8) {
-      return; // not a regular array; leave its pins to free routing
+    if (regularity < 0.7) {
+      // Not a regular array; leave its pins to free routing. (Threshold measured: bm04's
+      // U32 perimeter ring sits at 0.78 -- the old 0.8 gate silently deprived its pins of
+      // an escape axis and the planner fell back to nearest-spot placement.)
+      return;
     }
     double fill = p_pins.size() / (double) Math.max(1, xs.size() * ys.size());
     boolean grid_like = xs.size() >= 4 && ys.size() >= 4;
@@ -190,6 +193,25 @@ public final class PadArrayDetector {
         // (both ends of the axis may be legal), so record the axis only.
         axis_x = width > height ? 1 : 0;
         axis_y = width > height ? 0 : 1;
+      } else if (grid_like) {
+        // Square pad on a grid-like footprint (perimeter ring): exit toward the nearest
+        // array boundary -- outward -- exactly like the BGA dogbone direction. The
+        // row-perpendicular rule below is wrong here: an east-column ring pad would get a
+        // vertical axis, i.e. straight along its own column into the ring channel
+        // (measured on bm04 as the planner's corridor-blocking placements).
+        double to_left = center.x - xs.get(0);
+        double to_right = xs.get(xs.size() - 1) - center.x;
+        double to_bottom = center.y - ys.get(0);
+        double to_top = ys.get(ys.size() - 1) - center.y;
+        double min_x = Math.min(to_left, to_right);
+        double min_y = Math.min(to_bottom, to_top);
+        if (min_x <= min_y) {
+          axis_x = to_left <= to_right ? -1 : 1;
+          axis_y = 0;
+        } else {
+          axis_x = 0;
+          axis_y = to_bottom <= to_top ? -1 : 1;
+        }
       } else {
         // Square pad in a line component: exit perpendicular to the row direction, away from
         // the component centroid.

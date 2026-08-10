@@ -618,6 +618,54 @@ nearly solves both), so they gate regressions rather than motivate new machinery
 negotiation conversion wall (materialization DRC) reproduces here exactly (3/3 rejects),
 now measured on three boards.
 
+## Escape discipline on bm04: diagnosis, two refutations, the needs filter (2026-08-09)
+
+**Diagnosis** (per-net unrouted diff via the probe's new [probe-unrouted] report, plus
+per-escape position logging in the planner): baseline unrouted = {/PB7, /PB6, /MOSI};
+with escapes = {GND, /PB7, /PB6, /MISO}. Confirmed against the data: (c) **none of the
+planner's escapes served a baseline-unrouted net** -- every one went to a net the classic
+engine routes on the surface anyway; (b) about half the nearest-spot stubs ran ALONG the
+pad columns into the ring channels; (a) the west column's four vias sat at the identical
+offset -- a dead-straight full-span-via wall at x=1482684.
+
+**Detector fixes exposed by the diagnosis** (production PadArrayDetector): the 0.8
+regularity gate silently excluded U32 (measured 0.78), depriving its pins of any escape
+axis -- lowered to 0.7; and square-pad pins on grid-like footprints (perimeter rings)
+now take the BGA-style nearest-boundary OUTWARD axis instead of the row-perpendicular
+rule (which pointed east-column ring pads along their own column). 2-layer negotiation
+champion re-verified outcome-neutral after both changes (994.85/1, identical counters).
+
+**Placement A/Bs** (bm04, gate 979.01/3/0):
+- v1 nearest-spot: 14 escapes, fanout 81.8 -> 89.1 percent, **972.02/4** (the original
+  regression).
+- Axis-outward nearest: 16 escapes, fanout 90.1 percent, healthier directions (east
+  column exits east) -- still **972.02/4**.
+- Axis-outward farthest (break the via wall by distance): **965.03/5 -- REFUTED**, longer
+  stubs consume more corridor than the wall they avoid.
+- **Needs filter** (escape only pins whose nearest unconnected same-net item is beyond
+  the campaign's 150k long-connection threshold): **0 escapes inserted, exact baseline
+  parity 979.01/3/0 with the identical unrouted set, 2/2** -- the planner correctly
+  declines on a board where every escape is pure cost.
+
+**Verdict on bm04**: on a board whose only via is full-span, every escape blocks all 16
+layers, so escapes for classic-routable nets are strictly harmful -- the fanout
+percentage is a placement metric, not an endgame one (the campaign law, again).
+Endgame-positive escape machinery on bm04 means inserting NOTHING; the needs filter
+encodes that.
+
+**And the filter turns Issue732 POSITIVE -- the escape planner's first endgame win.**
+Where v1 inserted 17 escapes for parity (461.84/56/538), the axis-outward placement plus
+needs filter inserts **4** (the long-haul nets only), fanout 248 -> 252/303 (83.2%), and
+the full 20-minute run lands at **465.13 / 55 unrouted / 538 violations, 2/2 identical**
+-- one more net routed and a higher score than the standing gate, with zero added
+violations. Adding negotiation (+negpar) on top: identical 465.13/55/538 (negotiation
+commits 0 here, as measured before). The escape stage is now selective enough to pay for
+itself exactly where via scarcity is real, and silent where it is not.
+
+Regression checks after the detector changes: 2-layer flag-off **989.72/2/0** (exact
+baseline), 2-layer negotiation champion **994.85/1/0** with identical counters, bm04
+**979.01/3/0** with the identical unrouted set 2/2.
+
 ## Phase 5 increment 1: detection/reporting layer (2026-08-09)
 
 The probe now detects differential pairs by net-name convention (_P/_N, +/-, digitP/N) and
