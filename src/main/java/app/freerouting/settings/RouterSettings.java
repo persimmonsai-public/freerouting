@@ -46,6 +46,17 @@ public class RouterSettings implements Serializable, Cloneable {
   public String jobTimeoutString;
   @SerializedName("max_passes")
   public Integer maxPasses;
+  /**
+   * Time budget in milliseconds for routing a single connection (item-net pair) during the
+   * batch autoroute stage. When the budget expires mid-search, the routing attempt of that
+   * connection is abandoned and counted as unrouted for the pass; later passes may retry it.
+   * The budget caps the built-in escalating per-connection time limit and never extends it.
+   * {@code 0} (the default) or a negative value means unlimited, i.e. the historical behavior.
+   * It does not apply to the fanout pre-pass (see
+   * {@link FanoutSettings#maxMillisecondsPerPin}) or to the optimizer stage.
+   */
+  @SerializedName("max_milliseconds_per_item")
+  public Integer maxMillisecondsPerItem;
   @SerializedName("max_items")
   public transient Integer maxItems;
   @SerializedName("layers")
@@ -440,6 +451,7 @@ public class RouterSettings implements Serializable, Cloneable {
       }
     }
     result.maxPasses = this.maxPasses;
+    result.maxMillisecondsPerItem = this.maxMillisecondsPerItem;
     result.maxItems = this.maxItems;
     result.copperToEdgeClearanceUm = this.copperToEdgeClearanceUm;
     result.holeClearanceUm = this.holeClearanceUm;
@@ -459,6 +471,11 @@ public class RouterSettings implements Serializable, Cloneable {
     result.boardSpecificTraceCostsApplied = this.boardSpecificTraceCostsApplied;
 
     return result;
+  }
+
+  /** Per-connection autoroute time budget in milliseconds, or 0 when unlimited. */
+  public int getMaxMillisecondsPerItem() {
+    return (maxMillisecondsPerItem != null && maxMillisecondsPerItem > 0) ? maxMillisecondsPerItem : 0;
   }
 
   /** Neck width in micrometers, or 0 when width necking is disabled. */

@@ -497,9 +497,14 @@ public class BatchAutorouterThread extends StoppableThread {
       // Calculate the shortest distance between the two sets of items
       this.latest_air_line = calc_airline(route_start_set, route_dest_set);
 
-      // Calculate the maximum time for this autoroute pass
+      // Calculate the maximum time for this autoroute pass, capped by the optional
+      // per-item budget (router.max_milliseconds_per_item; 0 = unlimited).
       double max_milliseconds = 100000 * Math.pow(2, p_ripup_pass_no - 1);
       max_milliseconds = Math.min(max_milliseconds, Integer.MAX_VALUE);
+      int per_item_budget = settings.getMaxMillisecondsPerItem();
+      if (per_item_budget > 0) {
+        max_milliseconds = Math.min(max_milliseconds, per_item_budget);
+      }
       TimeLimit time_limit = new TimeLimit((int) max_milliseconds);
 
       // Initialize the auto-router engine
@@ -514,6 +519,13 @@ public class BatchAutorouterThread extends StoppableThread {
       if (autoroute_result.state == AutorouteAttemptState.ROUTED) {
         board.opt_changed_area(new int[0], null, trace_pull_tight_accuracy, autoroute_control.trace_costs, this,
             TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+      }
+
+      if (autoroute_result.state != AutorouteAttemptState.ROUTED
+          && per_item_budget > 0 && time_limit.limit_exceeded()) {
+        FRLogger.info("Autoroute time budget of " + per_item_budget + " ms exceeded for net '"
+            + (route_net != null ? route_net.name : "#" + p_route_net_no)
+            + "'; the connection is left unrouted in this pass.");
       }
 
       return autoroute_result;

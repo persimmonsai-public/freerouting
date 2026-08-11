@@ -990,6 +990,40 @@ public class BatchAutorouter extends NamedAlgorithm {
         && app.freerouting.Freerouting.globalSettings.featureFlags.partitionRouter;
   }
 
+  /**
+   * Creates the per-connection {@link TimeLimit} for one routing attempt. The base limit is the
+   * historical escalating schedule (100 s, doubled on every ripup pass). When the
+   * {@code router.max_milliseconds_per_item} budget is set ({@code > 0}), it caps that schedule
+   * so a single connection can never consume more than the configured budget. A budget of 0
+   * (the default) leaves the schedule unchanged.
+   */
+  private TimeLimit create_connection_time_limit(int p_ripup_pass_no) {
+    double max_milliseconds = 100000 * Math.pow(2, p_ripup_pass_no - 1);
+    max_milliseconds = Math.min(max_milliseconds, Integer.MAX_VALUE);
+    int per_item_budget = this.settings.getMaxMillisecondsPerItem();
+    if (per_item_budget > 0) {
+      max_milliseconds = Math.min(max_milliseconds, per_item_budget);
+    }
+    return new TimeLimit((int) max_milliseconds);
+  }
+
+  /**
+   * Logs one INFO line when a failed connection attempt ran out of its per-item time budget
+   * ({@code router.max_milliseconds_per_item}). Silent when the budget is unlimited (0) so
+   * default runs keep today's log output; the abandoned connection is simply counted as
+   * unrouted for this pass.
+   */
+  private void log_per_item_budget_exceeded(TimeLimit p_time_limit, int p_route_net_no) {
+    int per_item_budget = this.settings.getMaxMillisecondsPerItem();
+    if (per_item_budget <= 0 || p_time_limit == null || !p_time_limit.limit_exceeded()) {
+      return;
+    }
+    Net route_net = board.rules.nets.get(p_route_net_no);
+    FRLogger.info("Autoroute time budget of " + per_item_budget + " ms exceeded for net '"
+        + (route_net != null ? route_net.name : "#" + p_route_net_no)
+        + "'; the connection is left unrouted in this pass.");
+  }
+
   private boolean isParallelAutoroutingEnabled() {
     return app.freerouting.Freerouting.globalSettings != null
         // Opt-in and OFF by default -- see FeatureFlagsSettings#parallelAutorouter for the
@@ -1533,9 +1567,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       Set<Item> route_start_set = contains_plane ? connected_set : unconnected_set;
       Set<Item> route_dest_set = contains_plane ? unconnected_set : connected_set;
 
-      double max_milliseconds = 100000 * Math.pow(2, p_ripup_pass_no - 1);
-      max_milliseconds = Math.min(max_milliseconds, Integer.MAX_VALUE);
-      TimeLimit time_limit = new TimeLimit((int) max_milliseconds);
+      TimeLimit time_limit = create_connection_time_limit(p_ripup_pass_no);
 
       ShapeSearchTree scratch_tree = p_worker_scratch_trees.computeIfAbsent(
           autoroute_control.trace_clearance_class_no,
@@ -1547,6 +1579,9 @@ public class BatchAutorouter extends NamedAlgorithm {
       // worker in this batch has finished searching.
       AutorouteEngine.ConnectionPlan plan = autoroute_engine.search_connection(route_start_set,
           route_dest_set, autoroute_control, p_ripped_item_list, null);
+      if (plan != null && plan.failure != null) {
+        log_per_item_budget_exceeded(time_limit, p_route_net_no);
+      }
       return new SearchOutcome(plan, autoroute_control, autoroute_engine);
     } catch (Exception e) {
       FRLogger.error("Error during parallel routing search", e);
@@ -2245,10 +2280,9 @@ public class BatchAutorouter extends NamedAlgorithm {
       // Calculate the shortest distance between the two sets of items
       calc_airline(route_start_set, route_dest_set);
 
-      // Calculate the maximum time for this autoroute pass
-      double max_milliseconds = 100000 * Math.pow(2, p_ripup_pass_no - 1);
-      max_milliseconds = Math.min(max_milliseconds, Integer.MAX_VALUE);
-      TimeLimit time_limit = new TimeLimit((int) max_milliseconds);
+      // Calculate the maximum time for this autoroute pass, capped by the optional
+      // per-item budget (router.max_milliseconds_per_item).
+      TimeLimit time_limit = create_connection_time_limit(p_ripup_pass_no);
 
       // Stage-2 partition router: try the cheap canonical-partition search first; any
       // failure, unsupported case, or commit-time conflict falls through to the classic
@@ -2313,6 +2347,10 @@ public class BatchAutorouter extends NamedAlgorithm {
         if (strict_result != null) {
           return strict_result;
         }
+      }
+
+      if (autoroute_result.state != AutorouteAttemptState.ROUTED) {
+        log_per_item_budget_exceeded(time_limit, p_route_net_no);
       }
 
       return autoroute_result;

@@ -121,6 +121,7 @@ The primary way to configure Freerouting is through a JSON settings file. This f
 - **`default_preferred_direction_trace_cost`**: Cost factor for routing traces in the preferred direction.
 - **`default_undesired_direction_trace_cost`**: Cost factor for routing traces in undesired directions.
 - **`max_passes`**: Maximum number of routing passes.
+- **`max_milliseconds_per_item`**: Time budget in milliseconds for routing a single connection (item) during the autoroute stage. When the budget expires mid-search, the connection attempt is abandoned and counted as unrouted for that pass (later passes may retry it). Default is `0` (unlimited).
 - **`fanout_max_passes`**: Maximum number of passes for fanout routing.
 - **`max_threads`**: Maximum number of threads to use for routing.
 - **`improvement_threshold`**: Minimum improvement required to continue routing.

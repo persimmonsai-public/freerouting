@@ -93,6 +93,8 @@ public class DefaultSettings implements SettingsSource {
         settings.algorithm = RouterSettings.ALGORITHM_CURRENT;
         settings.jobTimeoutString = "12:00:00";
         settings.maxPasses = 9999;
+        // 0 = unlimited: a single connection may use the full built-in escalating time limit.
+        settings.maxMillisecondsPerItem = 0;
         settings.maxItems = Integer.MAX_VALUE;
         settings.trace_pull_tight_accuracy = 500;
         settings.vias_allowed = true;
