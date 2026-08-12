@@ -22,7 +22,9 @@ import java.util.List;
  * from the pad to that position is insertable, and place both as ordinary (rip-uppable)
  * items. Later routing then has all-layer access at every escaped pad.
  *
- * <p>Feasibility semantics follow the measured corrections behind
+ * <p>Per-pin feasibility is classified up front by {@link EscapeFeasibility} (the graduated
+ * spot scan): RULES_IMPOSSIBLE pins are reported in the run log and skipped without
+ * consuming search work. Placement legality follows the measured corrections behind
  * {@link PadArrayDetector#escape_spot_exists}: only the via's span layers are checked and
  * non-obstacle conduction areas (copper pours, which reflow) are passable. Candidates are
  * tried nearest-first, so stubs stay short. Pins are processed most-constrained-first
@@ -116,8 +118,37 @@ public final class EscapePlanner {
         stagger_lane.put(component_pins.get(i).get_id_no(), i % 2);
       }
     }
+    // Escape-feasibility classification (the graduated spot scan, read-only, before any
+    // insertion so verdicts are placement-order independent): RULES_IMPOSSIBLE pins are
+    // reported and skipped -- the design's own rules forbid their escape, so search work
+    // spent on them is pure waste -- and never silently dropped. ESCAPABLE_NOW and
+    // ORDERING_VICTIM pins proceed through the needs filter + placement pipeline unchanged.
+    // The skip keys on classify_for_planner (the planner's OWN placement geometry), whose
+    // RULES_IMPOSSIBLE verdict proves every candidate below would fail anyway -- skipping is
+    // outcome-neutral by construction. (Measured: keying on the probe's fixed accounting
+    // calibration instead changed caniot-tiny-arm from 26 inserted escapes to 11.)
+    java.util.Map<String, Integer> verdict_counts = new java.util.TreeMap<>();
+    java.util.Set<Integer> rules_impossible_ids = new java.util.HashSet<>();
+    for (Pin pin : candidates) {
+      EscapeFeasibility.Verdict verdict = EscapeFeasibility.classify_for_planner(p_board, pin);
+      verdict_counts.merge(verdict.name(), 1, Integer::sum);
+      if (verdict == EscapeFeasibility.Verdict.RULES_IMPOSSIBLE) {
+        rules_impossible_ids.add(pin.get_id_no());
+        FRLogger.info("[escape-planner] pin " + pin.get_id_no()
+            + " net=" + pin.get_net_no(0)
+            + " rules-impossible -- no legal spot for the planner's via within its scan"
+            + " reach, even ignoring routed copper; skipped");
+      } else {
+        FRLogger.info("[escape-planner] feasibility pin=" + pin.get_id_no()
+            + " net=" + pin.get_net_no(0) + " verdict=" + verdict);
+      }
+    }
+    FRLogger.info("[escape-planner] feasibility verdicts=" + verdict_counts);
     List<Item> planned_items = new ArrayList<>();
     for (Pin pin : candidates) {
+      if (rules_impossible_ids.contains(pin.get_id_no())) {
+        continue;
+      }
       if (!escape_needed(pin, threshold)) {
         continue;
       }

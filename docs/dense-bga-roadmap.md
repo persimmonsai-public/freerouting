@@ -954,3 +954,82 @@ full non-slow unit suite green.
 via padstack at all NPEs in `AutorouteControl.rebuild_via_info` (null `via_rule`) on
 every connection attempt -- the first fixture draft hit it; the shipped fixture defines a
 normal via rule instead.
+
+## EscapeFeasibility graduates to production; v1 heuristic removed (2026-08-12)
+
+`app.freerouting.autoroute.EscapeFeasibility` is the production form of the validated
+spatial spot scan (the corrected accounting's classifier); the retired v1
+interior/boundary heuristic (over-counted 48 of 57) is deleted from the probe. Verdicts:
+ESCAPABLE_NOW / ORDERING_VICTIM / RULES_IMPOSSIBLE. Semantics as measured: candidate via
+positions scanned against the default search tree on the via's SPAN layers only,
+IS-OBSTACLE passability (non-obstacle conduction areas/pours passable, same-net copper
+passable), and the ORDERING_VICTIM split via the consumed-spot analysis -- routed copper
+(traces and vias) ignored -- which is the probe's own pre-fanout approximation, cheap on
+the live board, so it GRADUATES to production (caveat documented in the class: boards
+carrying fixed pre-routed copper have it treated as consumable; on the measured fixtures
+pre-existing copper is pours and pads, where the approximation equals the true pre-fanout
+board). Deterministic, read-only.
+
+**Two calibrations, one scan engine -- and the distinction was forced by measurement:**
+
+- `classify(board, pin)` -- the ACCOUNTING form: globally smallest via, default clearance
+  class, the probe's 13500/1500 grid. This is what every roadmap escape accounting was
+  measured with; the probe now asserts production-vs-inline agreement PER PIN (the
+  ReturnPathReport graduation pattern).
+- `classify_for_planner(board, pin)` -- the PRE-FILTER form EscapePlanner keys skips on:
+  the planner's own placement geometry (smallest via covering the pin's layer, that via's
+  clearance class and span, reach = 3x pad extent, step = max(500, extent/4)) with the
+  scan's strictly-more-permissive passability. RULES_IMPOSSIBLE here proves every
+  candidate the planner would try is blocked even ignoring routed copper, so the skip is
+  outcome-neutral BY CONSTRUCTION. The naive alternative -- skipping on the accounting
+  calibration -- was implemented first and REFUTED by the caniot-tiny-arm canary: fixed
+  probe constants do not transfer across board unit scales and via sets (36 of 104
+  candidates mislabeled impossible, escapes 26 -> 11). Planner wiring: candidates are
+  classified up front (read-only, before any insertion, so verdicts are placement-order
+  independent); every pin's verdict is in the run log ("[escape-planner] pin X ...
+  rules-impossible ... skipped" / "feasibility pin=X ... verdict=V" + a summary count) --
+  unassignable pins are reported, never silently dropped; non-impossible pins proceed
+  through the needs filter + placement pipeline unchanged.
+
+**Accounting correction (measured at the RETRACTION commit itself):** the corrected
+accounting's Issue732-original post-fanout totals are **33 ESCAPABLE_NOW / 29
+ORDERING_VICTIM / 3 RULES_IMPOSSIBLE**, not 34/29/3 as previously written -- 34+29+3=66
+cannot tile the 65-pin unescaped set `{C21:1, C22:1, J3:3, J6:3, J8:1, R5:1, U1:9, U2:9,
+U3:1, U4:2, U5:28, U6:6}`; re-running the probe AT 82cf6fac reproduces today's
+per-component verdict map exactly (33/29/3). The "34" was a transcription error in the
+write-up, not code drift. Production classification agrees per pin on the identical map.
+
+**Harness fix discovered by the canary rerun:** with `org.gradle.configuration-cache=true`
+the eager `System.properties.each` forwarding in build.gradle bakes `-Dfr.*` values into
+the cache entry, and a later invocation with DIFFERENT values silently replays the stale
+entry (measured: a -Dfr.fixture=caniot escape run reused a no-property entry and ran bm01
+flag-off). Forwarding now goes through `providers.systemPropertiesPrefixedBy('fr.')`,
+which registers the property set as a configuration input so changes invalidate the entry.
+Any past measurement made in a session that mixed differing -Dfr.* invocations of the SAME
+task graph should be treated with suspicion until the log's "Loading board file" line is
+checked -- all gates below were re-verified after the fix.
+
+**Verification (all with the classifier wired in):**
+
+- Flag-off gates EXACT: bm01 **989.72/2/0**; bm05 2-min **831.77/18/0**; bm04 10-min
+  **979.01/3/0** (unrouted {/PB7, /PB6, /MOSI}).
+- caniot-tiny-arm escape+reflow 2-min: **26 escapes, 501.04/95/4 -- standing win held
+  exactly** (planner-geometry verdicts {ESCAPABLE_NOW=104} -- nothing skipped; the same
+  run under the refuted probe-calibration skip was 36 impossible / 11 escapes).
+- bm04 -Dfr.escape 10-min: **0 escapes inserted, 979.01/3/0 exact parity**, identical
+  unrouted set (planner-geometry verdicts {ESCAPABLE_NOW=35}; the needs filter still
+  declines everything).
+- Issue732 microvia escape+reflow 20-min: **4 escapes, 465.13/55/538 -- standing win held
+  exactly, 2/2 identical to the final BOARD HASH** (both runs end pass 5 on board
+  888c6422...), identical per-net unrouted set and identical escape via positions
+  (planner-geometry verdicts {ESCAPABLE_NOW=54, ORDERING_VICTIM=1}; zero skips, so the
+  exact score is the expected parity).
+- Probe classification (production asserts per-pin agreement with the inline scan):
+  Issue732 original post-fanout **33/29/3** (2/2 identical); microvia variant
+  {ESCAPABLE_NOW=55, ORDERING_VICTIM=5, impossible 0} over the probe's 60 unescaped pins
+  (the earlier "55/55, zero impossible" verdict counted a slightly different unescaped
+  set; the load-bearing claim -- ZERO rules-impossible with the microvia present -- holds
+  on every pin today as then); bm04
+  **{ESCAPABLE_NOW=35, ORDERING_VICTIM=4, impossible 0}** -- the exact accounting the
+  DAC2020 section recorded.
+

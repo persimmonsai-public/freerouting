@@ -97,7 +97,6 @@ class ArrayPadFieldProbeTest {
         via_to_layer = ps.to_layer();
       }
     }
-    int clearance = board.rules.clearance_matrix.get_value(1, 1, 0, false);
     for (Map.Entry<Integer, List<Pin>> entry : pins_by_component.entrySet()) {
       List<Pin> pins = entry.getValue();
       if (pins.size() < 8) {
@@ -138,42 +137,10 @@ class ArrayPadFieldProbeTest {
           + " regularity=(" + String.format("%.2f", regularity_x) + "," + String.format("%.2f", regularity_y) + ")"
           + " pad=" + (pad_box.ur.x - pad_box.ll.x) + "x" + (pad_box.ur.y - pad_box.ll.y)
           + (smd ? " SMD layer=" + sample.first_layer() : " TH"));
-      // Escape-feasibility classification of this component's unescaped pins:
-      // interior grid balls can only host a via at the grid diagonal; boundary balls can
-      // always dogbone outward into open space (-> algorithm-missed if unescaped).
-      int rules_impossible = 0;
-      int algorithm_missed = 0;
-      double diagonal_reach = Math.hypot(pitch_x, pitch_y) / 2;
-      double x_lo = xs.isEmpty() ? 0 : xs.get(0);
-      double x_hi = xs.isEmpty() ? 0 : xs.get(xs.size() - 1);
-      double y_lo = ys.isEmpty() ? 0 : ys.get(0);
-      double y_hi = ys.isEmpty() ? 0 : ys.get(ys.size() - 1);
-      for (Pin pin : pins) {
-        if (!unescaped_ids.contains(pin.get_id_no())) {
-          continue;
-        }
-        FloatPoint c = pin.get_center().to_float();
-        double tol = Math.max(1, Math.min(pitch_x, pitch_y) / 4);
-        boolean interior = c.x > x_lo + tol && c.x < x_hi - tol && c.y > y_lo + tol && c.y < y_hi - tol;
-        IntBox own_pad = pin.get_tile_shape_on_layer(pin.first_layer()).bounding_box();
-        int pad_half = Math.min(own_pad.ur.x - own_pad.ll.x, own_pad.ur.y - own_pad.ll.y) / 2;
-        double required = via_radius + clearance + pad_half;
-        if (interior && diagonal_reach < required) {
-          ++rules_impossible;
-        } else {
-          ++algorithm_missed;
-          System.out.println("[pad-array] missed pin=" + pin.get_id_no() + " comp=" + name
-              + " center=(" + Math.round(c.x) + "," + Math.round(c.y) + ")"
-              + " interior=" + interior + " net=" + (pin.net_count() > 0 ? pin.get_net_no(0) : -1));
-        }
-      }
-      if (rules_impossible + algorithm_missed > 0) {
-        System.out.println("[pad-array] escape-feasibility component=" + name
-            + " rules_impossible=" + rules_impossible
-            + " algorithm_missed=" + algorithm_missed
-            + " (diagonal_reach=" + Math.round(diagonal_reach)
-            + " vs required=via_r+clr+pad_half)");
-      }
+      // The v1 interior/boundary escape-feasibility heuristic that lived here is RETIRED
+      // (it over-counted 48 of 57 rules-impossible verdicts); the spatial spot scan below
+      // is the validated feasibility test, and app.freerouting.autoroute.EscapeFeasibility
+      // is its production graduation (asserted against the inline scan below).
     }
 
     // Violations already present on the (nearly) unrouted board: constant late-pass
@@ -223,6 +190,7 @@ class ArrayPadFieldProbeTest {
     // via position exist within dogbone reach? Binary outcome: fanout bug vs rules-impossible.
     var scan_tree = board.search_tree_manager.get_default_tree();
     Map<String, Integer> scan_verdicts = new java.util.TreeMap<>();
+    Map<String, Integer> production_verdicts = new java.util.TreeMap<>();
     int dbg_diag_logged = 0;
     for (Item item : board.get_items()) {
       if (!(item instanceof Pin pin) || !unescaped_ids.contains(pin.get_id_no())) {
@@ -290,8 +258,18 @@ class ArrayPadFieldProbeTest {
       String verdict = legal_spots > 0 ? "ESCAPABLE_NOW"
           : legal_spots_pre > 0 ? "ORDERING_VICTIM" : "RULES_IMPOSSIBLE";
       scan_verdicts.merge(comp_name + ":" + verdict, 1, Integer::sum);
+      // The graduated production classifier must agree with the inline scan PER PIN
+      // (the ReturnPathReport graduation pattern: probe asserts production against its
+      // own independent computation).
+      var production_verdict = app.freerouting.autoroute.EscapeFeasibility.classify(board, pin);
+      org.junit.jupiter.api.Assertions.assertEquals(verdict, production_verdict.name(),
+          "production EscapeFeasibility verdict for pin " + pin.get_id_no()
+              + " (" + comp_name + ")");
+      production_verdicts.merge("TOTAL:" + production_verdict.name(), 1, Integer::sum);
     }
     System.out.println("[pad-array] spot-scan verdicts=" + scan_verdicts);
+    System.out.println("[pad-array] production classifier agrees per pin; totals="
+        + production_verdicts);
     // Phase 5 reporting: differential pairs by net-name convention, planes per layer.
     java.util.Map<String, String> diff_pairs = new java.util.TreeMap<>();
     for (int n = 1; n <= board.rules.nets.max_net_no(); n++) {
