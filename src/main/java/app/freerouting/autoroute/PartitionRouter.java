@@ -474,6 +474,17 @@ public final class PartitionRouter {
    *     degenerates (the caller falls back to the classic engine)
    */
   public MazeSearchAlgo.Result materialize(CellRoute p_route, AutorouteControl p_ctrl) {
+    return materialize(p_route, p_ctrl, app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.liveChannelValidation);
+  }
+
+  /**
+   * As above; p_live_validation false realizes the plan from the channels exactly as the
+   * search produced them (the flag-off geometry), which is the retry path when the validated
+   * channels turn out not to be realizable.
+   */
+  public MazeSearchAlgo.Result materialize(CellRoute p_route, AutorouteControl p_ctrl,
+      boolean p_live_validation) {
     int layer = p_route.layer;
     int half_width = p_ctrl.compensated_trace_half_width[layer];
     List<FreeSpacePartition.Room> path = p_route.rooms;
@@ -539,16 +550,26 @@ public final class PartitionRouter {
       aim_to_x = target_escape[0];
       aim_to_y = target_escape[1];
     }
+    boolean live_validation = p_live_validation;
     for (int i = 1; i < path.size(); i++) {
       double t = i / (double) path.size();
       int window_x = (int) Math.round(aim_from_x + t * (aim_to_x - aim_from_x));
       int window_y = (int) Math.round(aim_from_y + t * (aim_to_y - aim_from_y));
-      window_x = Math.max(joints[i].ll.x, Math.min(joints[i].ur.x, window_x));
-      window_y = Math.max(joints[i].ll.y, Math.min(joints[i].ur.y, window_y));
+      // Under live validation the crossing point is clamped into the joint ERODED by the
+      // compensated half width, per axis: the door crossing is where consecutive maximal rooms
+      // overlap, so a raw clamp puts it against the item that bounds the overlap and the trace
+      // body -- half a width around it -- overlaps that item. Where an axis is too thin to
+      // erode, the joint's midpoint on that axis is the best available compromise.
+      IntBox clamp_box = live_validation ? eroded_per_axis(joints[i], channel_margin / 2) : joints[i];
+      window_x = Math.max(clamp_box.ll.x, Math.min(clamp_box.ur.x, window_x));
+      window_y = Math.max(clamp_box.ll.y, Math.min(clamp_box.ur.y, window_y));
       joints[i] = new IntBox(window_x, window_y, window_x, window_y)
           .offset(channel_margin).intersection(joints[i]);
     }
 
+    if (live_validation) {
+      ++live_plan_count;
+    }
     List<CompleteFreeSpaceExpansionRoom> rooms = new ArrayList<>(path.size());
     List<IntBox> channels = new ArrayList<>(path.size());
     for (int i = 0; i < path.size(); i++) {
@@ -556,6 +577,13 @@ public final class PartitionRouter {
           .intersection(path.get(i).box);
       if (channel.is_empty()) {
         return null;
+      }
+      if (live_validation) {
+        channel = live_free_channel(channel, joints[i], joints[i + 1], layer, p_ctrl, half_width);
+        if (channel == null) {
+          ++live_plan_reject_count;
+          return null;
+        }
       }
       channels.add(channel);
       rooms.add(new CompleteFreeSpaceExpansionRoom(channel, layer, i + 1));
@@ -663,6 +691,176 @@ public final class PartitionRouter {
   }
 
   private PadArrayDetector pad_array_detector;
+
+  /**
+   * Live channel validation (failure class 2 of the materialization taxonomy): returns a
+   * sub-box of p_channel whose TRACE CORRIDOR -- the box inflated by the pen half width the
+   * pre-insert DRC uses -- is free of foreign obstacles in the LIVE default search tree, or
+   * null when no such sub-box exists.
+   *
+   * <p>The partition's room cover proves free space against the compensated autoroute tree as
+   * it stood when the partition was last rebuilt, and it models the trace as a POINT: a
+   * centerline anywhere inside a free room still puts half a trace width plus clearance
+   * outside it. Both gaps produce plans whose channels look clean in the partition's model and
+   * fail the DRC on the live board. This validation closes both with the DRC's own query.
+   *
+   * <p>Two steps, both measured necessary (see the roadmap increment):
+   *
+   * <ol>
+   *   <li><b>Compensation erosion.</b> The channel is eroded by the compensated half width, so
+   *       a centerline anywhere inside it keeps the whole trace body inside the plan's own free
+   *       room even where Locate falls back to the raw room shape (it does that whenever its
+   *       own shrink empties) and around door-crossing doglegs, which it never checks. The two
+   *       door crossing points are kept by construction, so connectivity survives.
+   *   <li><b>Live tree check.</b> The eroded corridor is then queried against the LIVE default
+   *       search tree with the DRC's own clearance rule, which catches what the room cover
+   *       cannot model at all: items inserted since the partition was built, and clearance
+   *       classes other than the one the partition's tree was built for.
+   * </ol>
+   *
+   * <p>The pre-insert DRC still gates the commit afterwards; this can only remove space from a
+   * plan, never authorise geometry the DRC would refuse.
+   */
+  private IntBox live_free_channel(IntBox p_channel, IntBox p_entry, IntBox p_exit, int p_layer,
+      AutorouteControl p_ctrl, int p_compensated_half_width) {
+    int pen_half_width = p_ctrl.trace_half_width[p_layer];
+    int[] net_arr = new int[]{p_ctrl.net_no};
+    int erosion = p_compensated_half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE + 1;
+    IntBox current = compensated_channel(p_channel, p_entry, p_exit, erosion);
+    if (current.area() < p_channel.area()) {
+      ++live_shrink_count;
+    }
+    ShapeSearchTree live_tree = board.search_tree_manager.get_default_tree();
+    if (live_free(current, p_layer, pen_half_width, net_arr, p_ctrl.trace_clearance_class_no,
+        live_tree, p_channel)) {
+      return current;
+    }
+    ++live_occupied_channel_count;
+    if (LIVE_CHANNEL_DEBUG) {
+      app.freerouting.logger.FRLogger.info("[live-channel-reject] net=" + p_ctrl.net_no
+          + " layer=" + p_layer + " pen_hw=" + pen_half_width
+          + " comp_hw=" + p_compensated_half_width + " channel=" + box_key(p_channel)
+          + " validated=" + box_key(current) + " blocker=" + last_blocker_description);
+    }
+    return null; // no live-free channel: unrepairable in channel, rejected before geometry
+  }
+
+  /**
+   * Whether the trace corridor of p_box -- the box inflated by the pen half width, which is
+   * what the pre-insert DRC measures against -- is free of foreign obstacles in the live tree.
+   * p_full_channel is the unshrunk channel, used only for the stale-vs-compensation
+   * diagnostic split.
+   */
+  private boolean live_free(IntBox p_box, int p_layer, int p_pen_half_width, int[] p_net_arr,
+      int p_clearance_class, ShapeSearchTree p_live_tree, IntBox p_full_channel) {
+    IntBox corridor = p_box.offset(p_pen_half_width);
+    for (app.freerouting.datastructures.ShapeTree.TreeEntry entry
+        : p_live_tree.overlapping_tree_entries_with_clearance(corridor, p_layer, p_net_arr,
+            p_clearance_class)) {
+      if (!(entry.object instanceof Item item) || !item.is_trace_obstacle(p_net_arr[0])) {
+        continue;
+      }
+      TileShape shape = item.get_tree_shape(p_live_tree, entry.shape_index_in_object);
+      if (shape == null || shape.is_empty()) {
+        continue;
+      }
+      // The tree query is bounding-box based and "may also return items which are nearly
+      // overlapping" (its own words); without this exact test the predicate rejected every
+      // plan on the reference board -- measured, the first version of this validation.
+      if (shape.intersection(corridor).is_empty()) {
+        continue;
+      }
+      if (LIVE_CHANNEL_DEBUG) {
+        last_blocker_description = item.getClass().getSimpleName() + "#" + item.get_id_no()
+            + " box=" + box_key(shape.bounding_box());
+      }
+      if (!shape.intersection(p_full_channel).is_empty()) {
+        // The obstacle sits in the room cover's own free space: a stale partition (or a
+        // clearance class the partition's tree was not built for), not the trace-width
+        // compensation gap. Counted separately -- the two want different fixes.
+        ++live_stale_channel_count;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The channel a compensated trace can actually use: p_channel eroded by p_erosion (half the
+   * compensated trace width plus tolerance), unioned with the two door crossing points so the
+   * plan's connectivity survives, and falling back to those points alone when the channel is
+   * too thin to erode at all. Sound by construction: the result is always a sub-box of the
+   * channel, and always contains both crossing points.
+   */
+  static IntBox compensated_channel(IntBox p_channel, IntBox p_entry, IntBox p_exit,
+      int p_erosion) {
+    // The door crossing points are Locate's aim targets and must stay inside the channel; the
+    // eroded box is unioned with them, which is the minimum the plan's connectivity needs.
+    IntBox keep = joint_centre(p_entry).union(joint_centre(p_exit)).intersection(p_channel);
+    IntBox eroded = new IntBox(p_channel.ll.x + p_erosion, p_channel.ll.y + p_erosion,
+        p_channel.ur.x - p_erosion, p_channel.ur.y - p_erosion);
+    return eroded.is_empty() ? keep : eroded.union(keep);
+  }
+
+  /**
+   * p_box eroded by p_erosion on each axis independently; an axis too thin to erode collapses
+   * to its midpoint instead of emptying the box.
+   */
+  static IntBox eroded_per_axis(IntBox p_box, int p_erosion) {
+    int ll_x = p_box.ll.x + p_erosion;
+    int ur_x = p_box.ur.x - p_erosion;
+    if (ll_x > ur_x) {
+      ll_x = ur_x = (p_box.ll.x + p_box.ur.x) / 2;
+    }
+    int ll_y = p_box.ll.y + p_erosion;
+    int ur_y = p_box.ur.y - p_erosion;
+    if (ll_y > ur_y) {
+      ll_y = ur_y = (p_box.ll.y + p_box.ur.y) / 2;
+    }
+    return new IntBox(ll_x, ll_y, ur_x, ur_y);
+  }
+
+  /**
+   * The joint's centre as a degenerate box -- the door crossing point Locate aims at, which
+   * every shrunk channel must keep.
+   */
+  static IntBox joint_centre(IntBox p_joint) {
+    int cx = (int) Math.round((p_joint.ll.x + (double) p_joint.ur.x) / 2.0);
+    int cy = (int) Math.round((p_joint.ll.y + (double) p_joint.ur.y) / 2.0);
+    return new IntBox(cx, cy, cx, cy);
+  }
+
+  /**
+   * Per-reject channel/obstacle dump for diagnosis runs (-Dfr.livechannel.debug); off by
+   * default so the validation costs one tree query per channel and nothing else.
+   */
+  private static final boolean LIVE_CHANNEL_DEBUG = Boolean.getBoolean("fr.livechannel.debug");
+  private String last_blocker_description = "";
+  private long live_plan_count;
+  private long live_plan_reject_count;
+  private long live_occupied_channel_count;
+  private long live_stale_channel_count;
+  private long live_shrink_count;
+
+  /**
+   * Live channel validation counters since the last {@link #reset_live_channel_counters()}:
+   * plans validated, plans rejected early, channels found occupied on the live tree, of those
+   * occupied because the partition was stale (rather than because of trace-width/clearance
+   * compensation the room cover does not model), and channels successfully shrunk to a
+   * live-free sub-box.
+   */
+  public long[] live_channel_counters() {
+    return new long[]{live_plan_count, live_plan_reject_count, live_occupied_channel_count,
+        live_stale_channel_count, live_shrink_count};
+  }
+
+  public void reset_live_channel_counters() {
+    live_plan_count = 0;
+    live_plan_reject_count = 0;
+    live_occupied_channel_count = 0;
+    live_stale_channel_count = 0;
+    live_shrink_count = 0;
+  }
 
   private List<IntBox> last_channel_boxes = List.of();
 

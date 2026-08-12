@@ -747,7 +747,23 @@ public class BatchAutorouter extends NamedAlgorithm {
         + " already_connected=" + already_connected + " attempt_failures=" + attempt_failures
         + " attempt_drc_rejects=" + (partition_drc_reject_count - drc_rejects_before)
         + " checked_repairs=" + partition_checked_repair_count
+        + live_channel_report()
         + " in " + (System.currentTimeMillis() - t0) + " ms");
+  }
+
+  /**
+   * The live channel validation counters, or the empty string when the flag is off (so
+   * flag-off log output stays byte-identical).
+   */
+  private String live_channel_report() {
+    if (partition_router == null || app.freerouting.Freerouting.globalSettings == null
+        || !app.freerouting.Freerouting.globalSettings.featureFlags.liveChannelValidation) {
+      return "";
+    }
+    long[] counters = partition_router.live_channel_counters();
+    return " live_plans=" + counters[0] + " live_plan_rejects=" + counters[1]
+        + " live_occupied_channels=" + counters[2] + " live_stale_channels=" + counters[3]
+        + " live_shrinks=" + counters[4];
   }
   /**
    * Checked corner placement for a realized partition trace that failed the pre-insert DRC.
@@ -872,6 +888,62 @@ public class BatchAutorouter extends NamedAlgorithm {
   private long partition_checked_repair_count;
 
   /**
+   * Pre-validates every located trace of a realized plan with the board's own insertability
+   * predicate (check_polyline_trace -> check_trace_shape with contact pins) -- exactly what
+   * insert_forced_trace_polyline will enforce. This carries the pad-exit/tie-pin exemptions a
+   * plain clearance query cannot model, and a plan that fails it would otherwise be refused by
+   * the insert itself only after destructive shove attempts (measured: ~140 shove-insert
+   * failures per pass cost 58 s and left transient violations). A plan that passes inserts
+   * cleanly without shoving.
+   *
+   * <p>p_count is false for a non-final realization attempt, whose failure is not the
+   * connection's outcome and must not move the reject counters or the reject log.
+   */
+  private boolean insertable_plan(LocateFoundConnectionAlgo p_located, AutorouteControl p_ctrl,
+      boolean p_count) {
+    for (LocateFoundConnectionAlgo.ResultItem located_trace : p_located.connection_items) {
+      if (located_trace.corners == null || located_trace.corners.length < 2) {
+        continue;
+      }
+      boolean insertable;
+      try {
+        Polyline trace_polyline = new Polyline(located_trace.corners);
+        insertable = board.check_polyline_trace(trace_polyline, located_trace.layer,
+            p_ctrl.trace_half_width[located_trace.layer], new int[]{p_ctrl.net_no},
+            p_ctrl.trace_clearance_class_no);
+      } catch (Exception e) {
+        // Degenerate corner list -- not insertable as planned.
+        insertable = false;
+      }
+      if (!insertable && app.freerouting.Freerouting.globalSettings != null
+          && app.freerouting.Freerouting.globalSettings.featureFlags.checkedRealizer) {
+        insertable = checked_corner_repair(located_trace, p_ctrl,
+            partition_router.last_channel_boxes());
+      }
+      if (!insertable) {
+        if (!p_count) {
+          return false;
+        }
+        ++partition_drc_reject_count;
+        ++partition_fallback_count;
+        if (isNegotiatedRouterEnabled()) {
+          try {
+            Polyline reject_polyline = new Polyline(located_trace.corners);
+            String reason = board.explain_polyline_trace_reject(reject_polyline, located_trace.layer,
+                p_ctrl.trace_half_width[located_trace.layer], new int[]{p_ctrl.net_no},
+                p_ctrl.trace_clearance_class_no);
+            job.logInfo("[materialize-reject] net=" + p_ctrl.net_no + " " + reason);
+          } catch (Exception e) {
+            job.logInfo("[materialize-reject] net=" + p_ctrl.net_no + " degenerate corners");
+          }
+        }
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
    * Attempts the connection over the free-space partition. Returns a ROUTED result on success,
    * or null when the classic engine should handle the connection instead (no route found in the
    * partition, unsupported case, degenerate door chain, or the plan lost the commit-time
@@ -895,60 +967,47 @@ public class BatchAutorouter extends NamedAlgorithm {
         ++partition_fallback_count;
         return null;
       }
-      MazeSearchAlgo.Result seed = partition_router.materialize(route, p_ctrl);
-      if (seed == null) {
-        ++partition_fallback_count;
-        return null;
-      }
       SortedSet<Item> no_ripped = new TreeSet<>();
-      LocateFoundConnectionAlgo located = LocateFoundConnectionAlgo.get_instance(seed, p_ctrl, tree,
-          board.rules.get_trace_angle_restriction(), no_ripped, null);
-      if (located == null || located.connection_items == null || located.connection_items.isEmpty()) {
-        ++partition_fallback_count;
-        return null;
-      }
-      // Pre-validate every located trace with the board's own insertability predicate
-      // (check_polyline_trace -> check_trace_shape with contact pins) -- exactly what
-      // insert_forced_trace_polyline will enforce. This carries the pad-exit/tie-pin
-      // exemptions a plain clearance query cannot model, and a plan that fails it would
-      // otherwise be refused by the insert itself only after destructive shove attempts
-      // (measured: ~140 shove-insert failures per pass cost 58 s and left transient
-      // violations). A plan that passes inserts cleanly without shoving.
-      for (LocateFoundConnectionAlgo.ResultItem located_trace : located.connection_items) {
-        if (located_trace.corners == null || located_trace.corners.length < 2) {
+      // Under live channel validation the plan is realized twice at most: first from the
+      // channels the validation shrank to the live-free sub-boxes, and -- when that plan
+      // cannot be realized at all -- once more from the channels as searched, so validation
+      // can only ADD realizable plans, never remove one the unvalidated pipeline had. The
+      // pre-insert DRC gates both.
+      boolean live_validation = app.freerouting.Freerouting.globalSettings != null
+          && app.freerouting.Freerouting.globalSettings.featureFlags.liveChannelValidation;
+      int attempt_count = live_validation ? 2 : 1;
+      LocateFoundConnectionAlgo located = null;
+      for (int attempt = 0; attempt < attempt_count && located == null; attempt++) {
+        boolean last_attempt = attempt + 1 == attempt_count;
+        MazeSearchAlgo.Result seed = partition_router.materialize(route, p_ctrl,
+            live_validation && attempt == 0);
+        if (seed == null) {
+          if (last_attempt) {
+            ++partition_fallback_count;
+            return null;
+          }
           continue;
         }
-        boolean insertable;
-        try {
-          Polyline trace_polyline = new Polyline(located_trace.corners);
-          insertable = board.check_polyline_trace(trace_polyline, located_trace.layer,
-              p_ctrl.trace_half_width[located_trace.layer], new int[]{p_ctrl.net_no},
-              p_ctrl.trace_clearance_class_no);
-        } catch (Exception e) {
-          // Degenerate corner list -- not insertable as planned.
-          insertable = false;
-        }
-        if (!insertable && app.freerouting.Freerouting.globalSettings != null
-            && app.freerouting.Freerouting.globalSettings.featureFlags.checkedRealizer) {
-          insertable = checked_corner_repair(located_trace, p_ctrl,
-              partition_router.last_channel_boxes());
-        }
-        if (!insertable) {
-          ++partition_drc_reject_count;
-          ++partition_fallback_count;
-          if (isNegotiatedRouterEnabled()) {
-            try {
-              Polyline reject_polyline = new Polyline(located_trace.corners);
-              String reason = board.explain_polyline_trace_reject(reject_polyline, located_trace.layer,
-                  p_ctrl.trace_half_width[located_trace.layer], new int[]{p_ctrl.net_no},
-                  p_ctrl.trace_clearance_class_no);
-              job.logInfo("[materialize-reject] net=" + p_ctrl.net_no + " " + reason);
-            } catch (Exception e) {
-              job.logInfo("[materialize-reject] net=" + p_ctrl.net_no + " degenerate corners");
-            }
+        LocateFoundConnectionAlgo candidate = LocateFoundConnectionAlgo.get_instance(seed, p_ctrl, tree,
+            board.rules.get_trace_angle_restriction(), no_ripped, null);
+        if (candidate == null || candidate.connection_items == null
+            || candidate.connection_items.isEmpty()) {
+          if (last_attempt) {
+            ++partition_fallback_count;
+            return null;
           }
-          return null;
+          continue;
         }
+        if (!insertable_plan(candidate, p_ctrl, last_attempt)) {
+          if (last_attempt) {
+            return null;
+          }
+          continue;
+        }
+        located = candidate;
+      }
+      if (located == null) {
+        return null;
       }
       AutorouteEngine commit_engine = new AutorouteEngine(board, tree, false);
       AutorouteEngine.ConnectionPlan plan = AutorouteEngine.ConnectionPlan.found(located, null);
@@ -1349,10 +1408,14 @@ public class BatchAutorouter extends NamedAlgorithm {
       if (isPartitionRouterEnabled()) {
         job.logInfo("[partition-router] pass=" + p_pass_no + " routed=" + partition_routed_count
             + " fallback=" + partition_fallback_count
-            + " drc_reject=" + partition_drc_reject_count);
+            + " drc_reject=" + partition_drc_reject_count
+            + live_channel_report());
         partition_routed_count = 0;
         partition_fallback_count = 0;
         partition_drc_reject_count = 0;
+        if (partition_router != null) {
+          partition_router.reset_live_channel_counters();
+        }
       }
 
       // We are done with this pass

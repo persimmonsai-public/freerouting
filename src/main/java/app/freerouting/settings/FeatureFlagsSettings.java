@@ -117,6 +117,18 @@ public class FeatureFlagsSettings implements Serializable {
    * still gating the commit. Only affects partition/negotiation plans. Default off.
    */
   public boolean checkedRealizer = false;
+  /**
+   * Live channel validation for partition-originated plans (docs/dense-bga-roadmap.md,
+   * failure class 2 "unrepairable-in-channel"): at materialization time every windowed
+   * channel box of the plan is validated against the LIVE clearance-compensated search tree
+   * -- the same tree and clearance the pre-insert DRC uses -- instead of only the partition's
+   * room model. A channel whose trace corridor (the box inflated by the pen half width) meets
+   * a foreign obstacle is shrunk by axis cuts to the live-free sub-box, provided the cut keeps
+   * a trace-wide core around both door crossing points; when no such sub-box exists the plan
+   * is rejected BEFORE any geometry is realized, so the negotiation can price the reject
+   * cheaply. Only affects partition/negotiation plans. Default off.
+   */
+  public boolean liveChannelValidation = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

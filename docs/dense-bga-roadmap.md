@@ -1033,3 +1033,128 @@ checked -- all gates below were re-verified after the fix.
   **{ESCAPABLE_NOW=35, ORDERING_VICTIM=4, impossible 0}** -- the exact accounting the
   DAC2020 section recorded.
 
+
+## Live channel validation: class 2 converts, and the payoff is board-dependent (2026-08-12)
+
+`featureFlags.liveChannelValidation` (-Dfr.livechannel, default off) is what the
+checked-placement taxonomy asked for on failure class 2 ("unrepairable-in-channel"): the
+plan's channels are validated at MATERIALIZATION time against clearance-compensated
+reality, instead of a corner being retried after realization. Four parts, in the order the
+measurements forced them:
+
+1. **Door crossing windows are clamped into the ERODED joint.** The crossing point is
+   interpolated on the aim line and clamped into the room overlap; a raw clamp puts it
+   against the item that BOUNDS that overlap, and the trace body -- half a compensated
+   width around the point -- then overlaps that item. The clamp box is now the joint eroded
+   by the compensated half width, per axis, an axis too thin to erode collapsing to its
+   midpoint rather than emptying.
+2. **Every channel box is eroded by the compensated half width** (plus Locate's width
+   tolerance), then unioned with the two crossing points. A centerline anywhere in the
+   result keeps the whole trace body inside the plan's own free room -- which the room cover
+   never modelled, because it proves free space for a POINT. That matters because Locate
+   falls back to the RAW room shape whenever its own shrink empties, and its door-crossing
+   dogleg corners are never checked against any room at all.
+3. **The eroded corridor is queried against the LIVE default search tree** with the DRC's
+   own clearance rule (exact shape intersection, not the tree's bounding-box pre-filter). An
+   occupied channel rejects the plan BEFORE any geometry is realized, which is what the
+   negotiation wanted so it can price the reject cheaply.
+4. **A validated plan that cannot be realized is retried once from the channels as
+   searched.** Validation can then only ADD realizable plans, never remove one the
+   unvalidated pipeline had; the pre-insert DRC gates both attempts.
+
+**Measured, flag-off vs flag-on** (0 violations in every cell, both sides):
+
+| config | DRC rejects | commits | score |
+|---|---|---|---|
+| bm01 negotiation (+negpar) | 13 -> **2** | 3 -> **7** | 994.85/1 -> **979.47/4** |
+| bm04 negotiation (+negpar), 10 min | 3 -> **0** | 0 -> **3** | 979.01/3 -> **986.01/2** |
+| bm11 negotiation | 2 -> 2 | 1 -> 1 | 987.49/2 -> **987.49/2** (parity) |
+| bm05 partition quality mode | 8 -> **2** | 1 -> **7** | 794.39/22 -> **813.08/20** |
+| bm05 negotiation | 2 -> **1** | 1 -> **2** | 822.42/19 -> **822.42/19** (parity) |
+
+bm01 flag-on is 2/2 identical (979.47/4/0, identical counters); bm04 flag-on is 2/2
+identical (986.01/2/0), unrouted set {/PB7, /MISO} against the gate's {/PB7, /PB6, /MOSI}.
+
+**Class 2 converts.** 11 of bm01's 13 rejects, all 3 of bm04's, 6 of bm05's 8 and 1 of
+bm05's 2 in negotiation mode stop being rejects; four of bm01's, all three of bm04's and
+all six of bm05's turn into commits (the rest fail to realize in either channel form and go
+to the classic engine as before). That answers the taxonomy's open question: class 2 IS a
+geometry-model defect, and the missing model is the trace's own compensated WIDTH inside
+the plan's free rooms.
+
+**But it is not the live tree that finds it, and staleness is refuted.** The counters are
+unambiguous: `live_stale_channels=0` on every fixture and every pass -- no obstacle ever
+overlaps a channel box the partition called free -- and after erosion
+`live_occupied_channels` is 0 on bm01, bm04 and bm11 and 1 on bm05. The staleness half of
+the class-2 hypothesis ("items inserted since the plan was searched") is **REFUTED**: the
+partition is rebuilt per commit attempt and is not stale. The compensation half is the
+whole effect. The live-tree query is kept because it is what makes the erosion sound rather
+than merely plausible -- it is the check that would catch a stale partition or a foreign
+clearance class -- but on these boards it is nearly inert, and that is a measurement, not a
+design intent.
+
+**The conversions' worth is board-dependent, and that is the fifth measurement of the
+same law rather than a break in it.** bm04 gains a net from three commits (979.01/3 ->
+986.01/2) -- the first time partition-originated commits beat that gate at all -- and bm05
+partition mode recovers two of the four nets its quality mode was losing (794.39/22 ->
+813.08/20, against the 831.77/18 flag-off baseline). bm01, the most congested board and
+the standing champion, loses three nets to four extra commits (994.85/1 -> 979.47/4), and
+bm11 and bm05 negotiation hold exact parity. Congested corridors punish commits, boards
+with slack reward them -- the same split the generalization sweep measured for the commit
+policy, now reproduced at the materialization layer. What is new is that the commits are no
+longer suspect geometry: they are legal by the plan's own validation AND by the pre-insert
+DRC, they add no violations anywhere, and on bm01 they still cost nets. That residue is
+class 3 -- endgame-toxic-but-legal -- measured directly, with the geometry excuse removed.
+
+**Refutations banked along the way:**
+
+- **The first predicate was vacuous.** Validating the FULL channel corridor (channel box
+  inflated by the pen half width) against the live tree rejected 15 of 16 plans on bm01 and
+  cost two of the three standing commits (994.85/1 -> **989.72/2**). The reason is
+  structural: the partition's rooms are MAXIMAL free rectangles, so every channel border
+  touches an obstacle by construction and "corridor occupied" is true of every plan on a
+  dense board. A live-tree predicate has to be applied to an ERODED channel or it measures
+  nothing.
+- **The bounding-box tree query silently rejected everything.**
+  `overlapping_tree_entries_with_clearance` documents that it "may also return items, which
+  are nearly overlapping"; taking its results at face value rejected every plan -- the
+  obstacles it reported were up to 2334 units OUTSIDE the queried corridor. The exact
+  `shape.intersection(corridor)` test is load-bearing, and the version without it looked
+  exactly like a genuine refutation for three runs.
+- **Erosion without the retry fallback loses good plans.** With validation but no fallback,
+  bm11's single paying commit died as a realization failure (narrower channels, narrower
+  doors) and the board fell to the no-negotiation baseline: **987.49/2 -> 981.24/3**. With
+  the fallback it is parity, and bm05 partition improved 803.73/21 -> 813.08/20. A
+  validation that can lose plans is not a validation.
+- **Corner repair remains the wrong layer**, unchanged by this increment: `checkedRealizer`
+  is untouched and independent, and class 1 is still its business.
+
+**Failure-class accounting after this increment:**
+
+1. *Repairable-by-local-move* -- unchanged, still checkedRealizer's class.
+2. *Unrepairable-in-channel* -- **converted where it exists**: 11 of 13 on bm01 (4 to
+   commits), 3 of 3 on bm04 (3 to commits), 6 of 8 on bm05 partition (6 to commits), 1 of 2
+   on bm05 negotiation, 0 of 2 on bm11 (those two plans are realizable only in their
+   unvalidated form). Cause identified: the plan's channels never modelled the compensated
+   trace width, and Locate's raw-room fallback plus its unchecked door-crossing doglegs put
+   the trace body outside the room the partition proved free.
+3. *Endgame-toxic-but-legal* -- **the residual, and the whole story on bm01**: every
+   converted commit is legal by two independent checks and the board still loses nets. No
+   realizer change can touch this class; only a commit policy that prices corridor
+   opportunity cost.
+
+**Verdict: the flag stays default off.** It is the first mechanism in this campaign that
+converts class 2 at all, and it is worth +1 net on bm04 and +2 on bm05 partition mode with
+zero added violations -- but it costs 3 nets on the champion board and is inert on two
+others, so it is board-dependent in exactly the way the commit policy already is. Turning
+it on by default would trade the strongest gate for two weaker ones. It becomes defensible
+the day an acceptance policy can decline the bm01-shaped commits it enables; until then it
+is a diagnostic, a bm04/bm05 tool, and the geometry half of a commit-policy experiment.
+
+**Verification** (flag-off unless stated): bm01 flag-off **989.72/2/0**; bm01 negotiation
+champion **994.85/1/0** with the champion counters (committed=3, attempt_drc_rejects=13);
+bm05 flag-off 2-min **831.77/18/0**; bm04 flag-off 10-min **979.01/3/0** with the identical
+unrouted set; flag-on bm01 negotiation **979.47/4/0** 2/2 and bm04 negotiation
+**986.01/2/0** 2/2; `LiveChannelValidationTest` covers the channel geometry (containment in
+the plan's channel, both crossing points kept, the erosion margin where the channel allows
+it, the per-axis collapse) over randomized boxes; autoroute + settings unit suites green.
