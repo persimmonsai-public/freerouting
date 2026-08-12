@@ -466,6 +466,15 @@ tasks.withType(Test).configureEach { Test task ->
     // Absolute fixtures path so forked workers find DSN files even when user.dir is not the repo root.
     systemProperty 'freerouting.test.fixtures.dir', layout.projectDirectory.dir('fixtures').asFile.absolutePath
 
+    // Forward the measurement-harness properties (-Dfr.fixture, -Dfr.timeout, -Dfr.partition, ...)
+    // from the gradle invocation into the forked test JVMs. Gradle does not do this by itself,
+    // so without the forwarding the probe/gate tests silently run their default fixture.
+    System.properties.each { k, v ->
+        if (k.toString().startsWith('fr.')) {
+            systemProperty k.toString(), v.toString()
+        }
+    }
+
     testLogging {
         showExceptions = true
         showStandardStreams = true

@@ -718,7 +718,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       }
       AutorouteControl ctrl = new AutorouteControl(this.board, conn.net_no(), settings,
           this.settings.get_via_costs(), this.trace_cost_arr);
-      AutorouteAttemptResult result = try_partition_route(connected, unconnected, ctrl);
+      AutorouteAttemptResult result = try_partition_route(connected, unconnected, ctrl, -1);
       if (result != null && result.state == AutorouteAttemptState.ROUTED) {
         ++committed;
       } else {
@@ -867,10 +867,15 @@ public class BatchAutorouter extends NamedAlgorithm {
    * Attempts the connection over the free-space partition. Returns a ROUTED result on success,
    * or null when the classic engine should handle the connection instead (no route found in the
    * partition, unsupported case, degenerate door chain, or the plan lost the commit-time
-   * geometry re-validation because the partition was stale).
+   * geometry re-validation because the partition was stale). p_airline_distance is the
+   * connection's airline when the caller has it (per-item path) or negative (negotiation
+   * path); it feeds the [partition-commit] diagnostic only. A detour-ratio acceptance gate
+   * on it was measured and REFUTED 2026-08-12: no threshold separates bm05's toxic commits
+   * (1.97x and 1.72x airline, -4 and -1 nets) from bm01's beneficial ones (up to 2.79x) --
+   * see docs/dense-bga-roadmap.md, bm05 diagnosis.
    */
   private AutorouteAttemptResult try_partition_route(Set<Item> p_start_set, Set<Item> p_dest_set,
-      AutorouteControl p_ctrl) {
+      AutorouteControl p_ctrl, double p_airline_distance) {
     try {
       ShapeSearchTree tree = board.search_tree_manager.get_autoroute_tree(p_ctrl.trace_clearance_class_no);
       if (partition_router == null) {
@@ -951,6 +956,24 @@ public class BatchAutorouter extends NamedAlgorithm {
       }
       board.pop_snapshot();
       ++partition_routed_count;
+      // Per-commit diagnostic (flag-gated paths only): the realized length against the
+      // airline identifies which commit displaced what in an A/B unrouted-set diff.
+      double located_length = 0;
+      for (LocateFoundConnectionAlgo.ResultItem located_trace : located.connection_items) {
+        if (located_trace.corners == null) {
+          continue;
+        }
+        for (int i = 1; i < located_trace.corners.length; i++) {
+          located_length += located_trace.corners[i].to_float()
+              .distance(located_trace.corners[i - 1].to_float());
+        }
+      }
+      Net committed_net = board.rules.nets.get(p_ctrl.net_no);
+      job.logInfo("[partition-commit] net=" + (committed_net != null ? committed_net.name : "?")
+          + "(#" + p_ctrl.net_no + ") length=" + Math.round(located_length)
+          + " airline=" + (p_airline_distance > 0 ? String.valueOf(Math.round(p_airline_distance)) : "?")
+          + " detour=" + (p_airline_distance > 0
+              ? String.format("%.2f", located_length / p_airline_distance) : "?"));
       partition_router.invalidate();
       board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, p_ctrl.trace_costs,
           this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
@@ -2293,11 +2316,12 @@ public class BatchAutorouter extends NamedAlgorithm {
       // Acceptance policy under test: only LONG connections go to the partition router.
       // Short local connections are cheap for the classic engine, and their greedy partition
       // versions were measured to fragment corridors the endgame needs.
-      boolean long_connection = this.air_line != null && this.air_line.a != null
-          && this.air_line.b != null && this.air_line.a.distance(this.air_line.b) >= 150000;
+      double airline_distance = (this.air_line != null && this.air_line.a != null
+          && this.air_line.b != null) ? this.air_line.a.distance(this.air_line.b) : -1;
+      boolean long_connection = airline_distance >= 150000;
       if (isPartitionRouterEnabled() && !contains_plane && p_ripup_pass_no <= 1 && long_connection) {
         AutorouteAttemptResult partition_result = try_partition_route(route_start_set, route_dest_set,
-            autoroute_control);
+            autoroute_control, airline_distance);
         if (partition_result != null) {
           return partition_result;
         }

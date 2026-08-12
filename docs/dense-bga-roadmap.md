@@ -816,3 +816,66 @@ session-scale: paired routing (route the pair centreline, offset both traces -- 
 partition's windowed channels are a natural substrate since a channel can carry both),
 length matching (meander insertion using the partition's free-space knowledge), and
 return-path reporting over the plane census.
+
+## bm05 partition quality-mode regression: diagnosed to a single commit; geometry gate refuted (2026-08-12)
+
+The sweep's "clearest bug-shaped result" (bm05 831.77/18/0 off -> 794.39/22/0 with
+-Dfr.partition, 4 nets lost) is now diagnosed. Harness notes first: the profile harness
+(`RoutingProfileTest`, maxItems 500, maxPasses 8, maxThreads 1) gained the probe's per-net
+unrouted report (`[profile-unrouted]`), the quality mode gained a per-commit diagnostic
+(`[partition-commit] net/length/airline/detour`, flag-gated log only), and `build.gradle`
+now actually forwards `-Dfr.*` from the gradle command line into the forked test JVMs --
+without that forwarding the documented `-Dfr.fixture` interface silently ran the default
+fixture.
+
+**Reproduction**: flag-off 831.77/18/0 and flag-on 794.39/22/0, both 2/2 identical on
+score, violations, and the full per-net unrouted set at the 2-minute budget.
+
+**Diagnosis**: the quality mode participates only in pass 1 (routed=1 fallback=20
+drc_reject=8) and its ONE commit is /XADUIO_SCL(#12), realized at length 326560 against
+airline 165380 -- **1.97x detour**. The unrouted diff is exactly {+GND x1, +/XAUDIO_SDA x1,
++/XADUIO_SCL x2}: the committed route leaves its OWN net's remaining connections
+unroutable and takes the neighbouring I2C partner plus a GND connection with it. Flag-off
+reaches its best board in pass 2 (831.77/18, later restored by the end-of-run best-snapshot
+restore -- which works correctly in both configs); flag-on's ripup trajectory never
+recovers past its own pass 1 (passes 2-7 fall to 719-747).
+
+**The bug-shaped hypothesis -- a detour-ratio acceptance gate -- was implemented and
+REFUTED.** Commit detour distributions: bm01 12 commits at 1.07-1.54 plus one at 2.79;
+bm11 15 commits at 1.04-1.89; bm05's single commit at 1.97.
+
+| max detour | bm05 | bm01 (2-layer) | bm11 |
+|---|---|---|---|
+| none (shipped) | 794.39/22 | 994.85/1 | 987.49/2 |
+| 1.9 | 822.42/19 (a DIFFERENT commit at 1.72 slips in, -1 net) | 5 unrouted | 987.49/2 |
+| 1.5 | **831.77/18 -- exact parity, 0 commits, identical unrouted set** | 984.60/3 | 987.49/2 |
+
+bm05 needs every commit rejected to reach parity; bm01 needs every commit kept (including
+the 2.79 one) for its best score. No threshold satisfies both: commit toxicity is a
+property of the board's congestion where the corridor is spent, not of the commit's own
+geometry. This is the fifth independent measurement of the endgame-compatibility law, and
+the gate was reverted -- the 4-net magnitude on bm05 is one sprawling commit displacing
+three neighbour connections plus its own net's remainder, the same law that costs one net
+per commit elsewhere, amplified by where this particular route sprawls.
+
+**One new signature banked for the future commit policy**: on bm05 BOTH toxic commits left
+their own multi-terminal net incomplete (/XADUIO_SCL committed then x2 incomplete;
+/XAUDIO_I2S0_DOUT under the 1.9 gate committed then x1 incomplete), while on the winning
+boards every committed net completes. A policy that rips up a partition commit whose net
+fails to complete by end of pass -- opportunity cost observed rather than predicted -- is
+the shaped follow-up; a commit-time geometry filter is not.
+
+**Determinism observation** (pre-existing, both configs, unchanged by this work): score,
+violations, and the per-net unrouted set are 2/2 stable, but mid-pass board hashes are NOT
+run-to-run stable on bm05 -- pass-2 geometry varies with identical scores, flag-on and
+flag-off alike. Traced to the 1000 ms wall-clock pull-tight limit
+(`TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP` in `opt_changed_area` after each routed connection),
+which makes post-route pull-tight load-sensitive. Hash-level gates on this fixture would
+need that addressed; score-level gates are unaffected.
+
+**Gates re-verified on the final (diagnostics-only) code**: bm05 off 831.77/18/0 and on
+794.39/22/0 (both 2/2); 2-layer flag-off **989.72/2/0 exact**; 2-layer negotiation
+champion **994.85/1/0 exact** (committed=3, attempt_drc_rejects=13, the champion
+counters); 2-layer partition 994.85/1; bm11 off 981.24/3 and partition 987.49/2 (win
+held); bm04 flag-off 10-minute **979.01/3/0 exact** with the identical unrouted set
+{/PB7, /PB6, /MOSI}.

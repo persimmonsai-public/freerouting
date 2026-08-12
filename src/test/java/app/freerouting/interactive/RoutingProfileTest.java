@@ -68,6 +68,21 @@ class RoutingProfileTest {
     long elapsed = System.currentTimeMillis() - start;
 
     System.out.println("[profile-run] sequential routing completed in " + elapsed + "ms, state=" + job.state);
+
+    // Per-net unrouted report (same shape as the probe's [probe-unrouted]) so profile runs
+    // can be A/B-diffed net by net without re-running under the probe harness.
+    var incompletes_drc = new app.freerouting.drc.DesignRulesChecker(job.board, null);
+    incompletes_drc.calculateAllIncompletes();
+    java.util.List<String> unrouted_nets = new java.util.ArrayList<>();
+    for (int n = 1; n <= job.board.rules.nets.max_net_no(); n++) {
+      int incomplete_count = incompletes_drc.getIncompleteCount(n);
+      if (incomplete_count > 0) {
+        var net = job.board.rules.nets.get(n);
+        unrouted_nets.add((net == null ? "net#" + n : net.name) + "(#" + n + ")x" + incomplete_count);
+      }
+    }
+    System.out.println("[profile-unrouted] count=" + incompletes_drc.getIncompleteCount()
+        + " nets=" + unrouted_nets);
   }
 
   private RoutingJob createRoutingJob(String filename, TestingSettings testingSettings) {
