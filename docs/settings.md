@@ -122,6 +122,9 @@ The primary way to configure Freerouting is through a JSON settings file. This f
 - **`default_undesired_direction_trace_cost`**: Cost factor for routing traces in undesired directions.
 - **`max_passes`**: Maximum number of routing passes.
 - **`max_milliseconds_per_item`**: Time budget in milliseconds for routing a single connection (item) during the autoroute stage. When the budget expires mid-search, the connection attempt is abandoned and counted as unrouted for that pass (later passes may retry it). Default is `0` (unlimited).
+- **`rule_regions`**: Region-scoped rule overrides (requires `featureFlags.ruleRegions`; default off). An array of regions, each an axis-aligned box plus a layer set carrying a clearance override and optionally a trace half-width override, e.g.
+  `[{"layers": "*", "box_um": [500, -7000, 19500, -3000], "clearance_um": 76.2, "trace_halfwidth_um": 75}]`.
+  All values are in micrometers in the DSN coordinate frame (the numbers you read in the DSN file when its unit is `um`; converted with the board's own coordinate transform at load time, so mil/inch DSN units work too; Y keeps the DSN sign convention). `layers` is `"*"` or a comma-separated list of 0-based layer indices or layer names. Inside a region the DRC allows min(global, region) clearance, and connections that fail at global rules with a terminal in a region are retried once at the region's rules; the retry is kept only if everything it inserted outside the region still satisfies the global rules. Default is no regions.
 - **`fanout_max_passes`**: Maximum number of passes for fanout routing.
 - **`max_threads`**: Maximum number of threads to use for routing.
 - **`improvement_threshold`**: Minimum improvement required to continue routing.

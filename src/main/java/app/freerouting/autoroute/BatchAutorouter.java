@@ -150,6 +150,14 @@ public class BatchAutorouter extends NamedAlgorithm {
     // fail outright. Do not flip this without redesigning room construction to be
     // context-free with periodic re-coarsening.
     this.retain_autoroute_database = false;
+
+    // Region-scoped rule overrides (Phase 1 item 1): resolve router.rule_regions against the
+    // board's coordinate system and install them on the board. Idempotent and flag-gated;
+    // with the flag off (the default) the board never carries regions and every region-aware
+    // code path is inert.
+    if (app.freerouting.Freerouting.globalSettings.featureFlags.ruleRegions) {
+      app.freerouting.board.RuleRegion.install(this.board, this.settings);
+    }
   }
 
   /**
@@ -2351,6 +2359,29 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       if ((autoroute_result.state == AutorouteAttemptState.FAILED
           || autoroute_result.state == AutorouteAttemptState.INSERT_ERROR)
+          && isRuleRegionsEnabled()) {
+        AutorouteAttemptResult region_result = retryConnectionInRegion(p_route_net_no,
+            curr_via_costs, route_start_set, route_dest_set, p_ripped_item_list, p_ripup_costs,
+            p_ripup_pass_no, time_limit);
+        if (region_result != null) {
+          if (region_result.state == AutorouteAttemptState.ROUTED) {
+            AutorouteAttemptResult strict_result = applyStrictDrcAfterRoute(p_route_net_no,
+                maxItemIdBeforeRoute, strictDrcBoardSnapshot);
+            if (strict_result != null) {
+              return strict_result;
+            }
+            return region_result;
+          }
+          // The retry mutated the board and was rolled back via a snapshot restore, so item
+          // identities from before the retry are stale. Report the original failure without
+          // chaining further retries against stale item sets (same containment contract as
+          // the strict-DRC restore).
+          return autoroute_result;
+        }
+      }
+
+      if ((autoroute_result.state == AutorouteAttemptState.FAILED
+          || autoroute_result.state == AutorouteAttemptState.INSERT_ERROR)
           && this.settings.getNeckWidthUm() > 0) {
         AutorouteAttemptResult necked_result = retryConnectionNecked(p_route_net_no, autoroute_control,
             curr_via_costs, route_start_set, route_dest_set, p_ripped_item_list, p_ripup_costs,
@@ -2448,6 +2479,142 @@ public class BatchAutorouter extends NamedAlgorithm {
         + (route_net != null ? route_net.name : "#" + p_route_net_no)
         + "' at " + this.settings.getNeckWidthUm() + " um trace width.");
     return neck_result;
+  }
+
+  /** Region-scoped rules are active only when the flag is on AND regions were installed. */
+  private boolean isRuleRegionsEnabled() {
+    return this.board.rule_regions != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.ruleRegions;
+  }
+
+  /**
+   * Region-rules retry (docs/dense-bga-roadmap.md Phase 1 item 1): when a connection failed
+   * at its global rules and one of its terminals touches a rule region, retry it ONCE at the
+   * region's rules -- the region's clearance class (so the maze search's compensated
+   * obstacle expansion shrinks to the region clearance) and, when the region overrides it,
+   * every layer's trace half-width clamped to the region half-width.
+   *
+   * <p>Region scoping is enforced AFTER the retry routes: every newly inserted trace shape
+   * that is not fully inside the triggering region must still pass the global-clearance
+   * insertability check, otherwise the whole retry is rolled back via a board snapshot and
+   * the original failure stands. Inside the region the inserted traces carry the region's
+   * clearance class, so the scored DRC (clearance matrix driven) agrees that they are legal.
+   *
+   * <p>v1 limits, deliberate: vias keep their global clearance class (regions neck traces,
+   * not vias); the retry runs in the sequential router path only; and a post-retry shove by a
+   * LATER connection could in principle push a region-class trace outside its region without
+   * re-checking the global rule there (same exposure window as any shove; strict_drc catches
+   * it when enabled).
+   *
+   * @return a ROUTED result when the retry succeeded and was kept; a non-ROUTED result when
+   *         the retry ran but was rolled back (the board was restored from a snapshot, so
+   *         the caller must not touch pre-retry item references); or null when no region
+   *         triggered and the board was not touched.
+   */
+  private AutorouteAttemptResult retryConnectionInRegion(int p_route_net_no, int p_via_costs,
+      Set<Item> p_route_start_set, Set<Item> p_route_dest_set, SortedSet<Item> p_ripped_item_list,
+      Map<Item, Integer> p_ripup_costs, int p_ripup_pass_no, TimeLimit p_time_limit) {
+    app.freerouting.board.RuleRegion region = findTriggeringRegion(p_route_start_set, p_route_dest_set);
+    if (region == null) {
+      return null;
+    }
+    Net route_net = board.rules.nets.get(p_route_net_no);
+    String net_name = (route_net != null) ? route_net.name : ("#" + p_route_net_no);
+    int max_item_id_before = board.communication.id_no_generator.max_generated_no();
+    byte[] board_snapshot = board.serialize(false);
+
+    AutorouteControl region_control = new AutorouteControl(this.board, p_route_net_no, settings,
+        p_via_costs, this.trace_cost_arr);
+    region_control.ripup_allowed = true;
+    region_control.ripup_costs = this.start_ripup_costs * p_ripup_pass_no;
+    region_control.remove_unconnected_vias = this.remove_unconnected_vias;
+    int global_clearance_class = region_control.trace_clearance_class_no;
+    region_control.trace_clearance_class_no = region.clearance_class_no;
+    for (int i = 0; i < region_control.layer_count; i++) {
+      if (region.trace_half_width > 0) {
+        region_control.trace_half_width[i] = Math.min(region_control.trace_half_width[i],
+            region.trace_half_width);
+      }
+      region_control.compensated_trace_half_width[i] = region_control.trace_half_width[i]
+          + board.rules.clearance_matrix.clearance_compensation_value(region.clearance_class_no, i);
+    }
+
+    AutorouteEngine region_engine = board.init_autoroute(p_route_net_no, region.clearance_class_no,
+        this.thread, p_time_limit, this.retain_autoroute_database);
+    AutorouteAttemptResult region_result = region_engine.autoroute_connection(p_route_start_set,
+        p_route_dest_set, region_control, p_ripped_item_list, p_ripup_costs);
+    if (region_result.state != AutorouteAttemptState.ROUTED) {
+      // The failed attempt may have ripped or shoved items: restore the exact pre-retry
+      // board so the retry is invisible unless it succeeds.
+      this.board = (RoutingBoard) BasicBoard.deserialize(board_snapshot);
+      return region_result;
+    }
+    board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, region_control.trace_costs,
+        this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+    String reject_reason = checkRegionScopedInsertion(p_route_net_no, max_item_id_before, region,
+        global_clearance_class);
+    if (reject_reason != null) {
+      FRLogger.info("[rule-region] retry for net '" + net_name + "' rolled back: " + reject_reason);
+      this.board = (RoutingBoard) BasicBoard.deserialize(board_snapshot);
+      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
+          "rule_region: " + reject_reason);
+    }
+    FRLogger.info("[rule-region] routed net '" + net_name + "' at region rules ("
+        + region.name + ", clearance=" + region.clearance
+        + ", trace_half_width=" + region.trace_half_width + ").");
+    return region_result;
+  }
+
+  /**
+   * The first configured region (settings order, deterministic) whose box intersects the
+   * bounding box of any terminal item of the connection, or null. v1 trigger semantics: a
+   * terminal touching the region is what marks a connection as region-relevant.
+   */
+  private app.freerouting.board.RuleRegion findTriggeringRegion(Set<Item> p_route_start_set,
+      Set<Item> p_route_dest_set) {
+    if (board.rule_regions == null) {
+      return null;
+    }
+    for (app.freerouting.board.RuleRegion region : board.rule_regions) {
+      for (Item curr_item : p_route_start_set) {
+        if (region.box.intersects(curr_item.bounding_box())) {
+          return region;
+        }
+      }
+      for (Item curr_item : p_route_dest_set) {
+        if (region.box.intersects(curr_item.bounding_box())) {
+          return region;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Region scoping check for a kept region retry: every tile shape of every newly inserted
+   * trace (item id above p_max_item_id_before) that is NOT fully inside the triggering
+   * region must pass the insertability check at the global clearance class. Returns a
+   * human-readable reason for the first failure, or null when the insertion is properly
+   * region-scoped. Vias are not checked: they keep their global clearance class throughout.
+   */
+  private String checkRegionScopedInsertion(int p_route_net_no, int p_max_item_id_before,
+      app.freerouting.board.RuleRegion p_region, int p_global_clearance_class) {
+    for (Item curr_item : board.get_connectable_items(p_route_net_no)) {
+      if (curr_item.get_id_no() <= p_max_item_id_before
+          || !(curr_item instanceof PolylineTrace curr_trace)) {
+        continue;
+      }
+      int check_class = (curr_trace.clearance_class_no() == p_region.clearance_class_no)
+          ? p_global_clearance_class
+          : curr_trace.clearance_class_no();
+      int failing_shape = board.first_trace_shape_outside_region_failing_global_rule(
+          curr_trace, p_region, check_class);
+      if (failing_shape >= 0) {
+        return "trace shape " + failing_shape + " of item #" + curr_item.get_id_no()
+            + " outside region " + p_region.name + " fails the global clearance rule";
+      }
+    }
+    return null;
   }
 
   /**

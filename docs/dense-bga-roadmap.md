@@ -879,3 +879,78 @@ champion **994.85/1/0 exact** (committed=3, attempt_drc_rejects=13, the champion
 counters); 2-layer partition 994.85/1; bm11 off 981.24/3 and partition 987.49/2 (win
 held); bm04 flag-off 10-minute **979.01/3/0 exact** with the identical unrouted set
 {/PB7, /PB6, /MOSI}.
+
+## Phase 1 item 1: region-scoped rules v1 (2026-08-12)
+
+`featureFlags.ruleRegions` (default off) + `router.rule_regions` -- an array of
+axis-aligned boxes with a layer set, each carrying a clearance override and optionally a
+trace half-width override. Configured through the router settings JSON (the
+max_milliseconds_per_item pattern; new `RuleRegionSettings`, documented in
+docs/settings.md) or, for the measurement harness, `-Dfr.regions='[{"layers":"*",
+"box_um":[x1,y1,x2,y2],"clearance_um":N,"trace_halfwidth_um":M}]'` whose presence enables
+the flag. **Units**: micrometers in the DSN coordinate frame (the numbers as read in the
+DSN file), resolved at install time with the board's own `coordinate_transform` (scale =
+DSN resolution with the parser's overflow reduction; base offset 0; Y keeps the DSN sign
+convention), so 80 um resolves to 800 board units on the 10-units/um fixtures. Regions
+live on the board (`BasicBoard.rule_regions`, serialized so snapshot rollbacks preserve
+them), installed by the BatchAutorouter constructor only when the flag is on -- flag-off
+boards never carry regions and every region-aware code path starts with a null check.
+
+**Which engine layers honor regions in v1** (the honest reach statement):
+
+1. **DRC insertability check** (`check_trace_shape`, hence `check_polyline_trace` /
+   `first_failing_trace_shape`): an obstacle pair failing the global-clearance query is
+   re-checked at the region clearance and waived when legal there. Pair rule: min(global,
+   region) applies when AT LEAST ONE shape of the pair lies fully inside a region box on
+   the checked layer. The roadmap's v1 sketch ("checked shape fully inside") is this rule
+   made symmetric; the STRICTER both-shapes-inside variant was implemented first and
+   REFUTED by measurement: fixed copper reaching into an exception zone (the exact
+   fine-pitch scenario) always straddles the region boundary, so the cap never applied
+   and the region was dead. Uncompensated default tree only (the standard configuration);
+   a compensation-enabled default tree skips region logic.
+2. **Scored DRC** (`Item.clearance_violations`): the identical pair rule via the shared
+   `rule_region_pair_clearance` helper, so the insertability check and the violation count
+   cannot disagree and flag-on runs add no scored violations.
+3. **The engine, via a region retry** (sequential path, same hook as the neckdown retry,
+   tried before it): a connection that fails at global rules and has a terminal item
+   intersecting a region box is retried ONCE at the region's rules. The maze search runs
+   with a dedicated clearance class appended per region at install time (value = region
+   clearance against every class, so the compensated obstacle expansion genuinely shrinks
+   -- this is real maze reach, not DRC-only) and with every layer's trace half-width
+   clamped to the region half-width. Region SCOPING of that board-wide retry is enforced
+   after routing: every newly inserted trace shape not fully inside the region must pass
+   the global-clearance check, else the board is rolled back from a snapshot (the strict
+   DRC restore machinery) and the original failure stands.
+
+**Not reached in v1, deliberately**: per-region compensation inside a single search (the
+retry is all-or-nothing region rules, scoped by trigger + post-check); the parallel
+autorouter path; the partition's `min_pass` admissions (only reachable behind the
+partition/negotiation flags; deferred); vias (they keep the global via clearance class --
+regions neck traces, not vias); the fanout stage. Known v1 exposure: a later connection's
+shove can push a region-class trace outside its region without a global re-check there
+(same window as any shove; strict_drc catches it when enabled).
+
+**Flag-on demonstration** (new synthetic fixture `fixtures/RuleRegionGap.dsn` + JUnit
+`RuleRegionRoutingTest`, since no gate fixture exhibits the lockout cleanly): 2 layers,
+one net, a fixed wall with two identical 500-um gaps -- one inside the configured region,
+one outside. Global rules (300 um width / 200 um clearance) need 700 um, region rules
+(150 um width / 80 um clearance) need 310 um. Measured: (a) a 150-um-wide gap crossing
+at 175 um from the wall stubs FAILS `check_polyline_trace` with no regions and PASSES
+with the region installed, while the geometrically identical crossing of the
+outside-region gap still fails; (b) end-to-end, flag-off finishes **0.00 / 1 unrouted /
+0 violations** (wall impassable, score 0 on a 1-net board) and flag-on finishes
+**999.99 / 0 unrouted / 0 violations** through the in-region gap via the region retry --
+**2/2 identical final board hashes** (also re-demonstrated through the `-Dfr.regions`
+harness path). Settings plumbing covered by `RuleRegionsSettingsTest` (Gson round-trip,
+clone, merge, defaults).
+
+**Gates after the change, all exact**: bm01 flag-off **989.72/2/0** (unrouted
+{ADC12, TXD1}); bm01 negotiation champion **994.85/1/0** with the champion counters
+(committed=3, attempt_drc_rejects=13); bm05 flag-off 2-min **831.77/18/0**; bm04
+flag-off 10-min **979.01/3/0** with the identical unrouted set {/PB7, /PB6, /MOSI};
+full non-slow unit suite green.
+
+**Discovered in passing** (pre-existing, not fixed here): a board whose DSN defines no
+via padstack at all NPEs in `AutorouteControl.rebuild_via_info` (null `via_rule`) on
+every connection attempt -- the first fixture draft hit it; the shipped fixture defines a
+normal via rule instead.

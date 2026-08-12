@@ -57,6 +57,14 @@ public class RouterSettings implements Serializable, Cloneable {
    */
   @SerializedName("max_milliseconds_per_item")
   public Integer maxMillisecondsPerItem;
+  /**
+   * Region-scoped rule overrides (box + layer set carrying a clearance override and
+   * optionally a trace half-width override), in micrometers in the DSN coordinate frame.
+   * Only honored when {@code featureFlags.ruleRegions} is enabled; absent/empty means no
+   * regions. See {@link RuleRegionSettings} for units and semantics.
+   */
+  @SerializedName("rule_regions")
+  public RuleRegionSettings[] ruleRegions;
   @SerializedName("max_items")
   public transient Integer maxItems;
   @SerializedName("layers")
@@ -452,6 +460,12 @@ public class RouterSettings implements Serializable, Cloneable {
     }
     result.maxPasses = this.maxPasses;
     result.maxMillisecondsPerItem = this.maxMillisecondsPerItem;
+    if (this.ruleRegions != null) {
+      result.ruleRegions = new RuleRegionSettings[this.ruleRegions.length];
+      for (int i = 0; i < this.ruleRegions.length; i++) {
+        result.ruleRegions[i] = (this.ruleRegions[i] != null) ? this.ruleRegions[i].clone() : null;
+      }
+    }
     result.maxItems = this.maxItems;
     result.copperToEdgeClearanceUm = this.copperToEdgeClearanceUm;
     result.holeClearanceUm = this.holeClearanceUm;
@@ -476,6 +490,11 @@ public class RouterSettings implements Serializable, Cloneable {
   /** Per-connection autoroute time budget in milliseconds, or 0 when unlimited. */
   public int getMaxMillisecondsPerItem() {
     return (maxMillisecondsPerItem != null && maxMillisecondsPerItem > 0) ? maxMillisecondsPerItem : 0;
+  }
+
+  /** Configured rule regions, or an empty array when none are configured. */
+  public RuleRegionSettings[] getRuleRegions() {
+    return (ruleRegions != null) ? ruleRegions : new RuleRegionSettings[0];
   }
 
   /** Neck width in micrometers, or 0 when width necking is disabled. */

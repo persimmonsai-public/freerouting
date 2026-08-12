@@ -474,6 +474,22 @@ public abstract class Item implements Drawable, SearchTreeObject, ObjectInfoPane
           }
 
           TileShape intersection = enlarged_shape_1.intersection(enlarged_shape_2);
+          if (intersection.dimension() == 2
+              && board.rule_regions != null
+              && !this.board.search_tree_manager.is_clearance_compensation_used()) {
+            // Region-scoped rules (v1 semantics, same pair rule as check_trace_shape --
+            // see BasicBoard.rule_region_pair_clearance): the pair is not a violation when
+            // at least one of its shapes lies fully inside a rule region on this layer and
+            // the pair satisfies the region's (smaller) clearance.
+            int region_clearance = board.rule_region_pair_clearance(shape_1, shape_2, shape_layer(i));
+            if (region_clearance >= 0 && region_clearance < minimum_clearance) {
+              TileShape region_enlarged_1 = (TileShape) shape_1.enlarge(0.5 * region_clearance);
+              TileShape region_enlarged_2 = (TileShape) shape_2.enlarge(0.5 * region_clearance);
+              if (region_enlarged_1.intersection(region_enlarged_2).dimension() != 2) {
+                continue;
+              }
+            }
+          }
           if (intersection.dimension() == 2) {
             ClearanceViolation curr_violation = new ClearanceViolation(this, curr_item, intersection, shape_layer(i), minimum_clearance, actual_clearance);
             result.add(curr_violation);

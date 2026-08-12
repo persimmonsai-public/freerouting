@@ -95,6 +95,20 @@ public class FeatureFlagsSettings implements Serializable {
    */
   public boolean pairCorridorAffinity = false;
   /**
+   * Region-scoped rule overrides (docs/dense-bga-roadmap.md Phase 1 item 1): axis-aligned
+   * boxes with a layer set, a clearance override and optionally a trace half-width override,
+   * configured via {@code router.rule_regions}. When enabled: (1) the DRC insertability check
+   * ({@code BasicBoard.check_trace_shape}) and the scored violation count
+   * ({@code Item.clearance_violations}) use min(global, region) clearance for item pairs where
+   * at least one shape of the pair lies fully inside a region on the checked layer; (2) a connection that fails at
+   * global rules and has a terminal inside a region is retried once by the batch autorouter at
+   * the region's clearance (via a dedicated clearance class appended at install time) and
+   * clamped trace half-width, and the retry is kept only if every newly inserted trace shape
+   * OUTSIDE the region still satisfies the global rules (otherwise the board is rolled back).
+   * Default off; flag-off code paths are unchanged.
+   */
+  public boolean ruleRegions = false;
+  /**
    * Checked corner placement for partition-originated plans: when a realized trace fails
    * the pre-insert DRC, the FAILING corner (located by tile-shape index) is retried against
    * a bounded ordered candidate set -- mirrored dogleg, midpoint straighten, clamp into the

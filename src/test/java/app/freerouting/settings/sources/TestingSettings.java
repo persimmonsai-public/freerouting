@@ -79,6 +79,10 @@ public class TestingSettings implements SettingsSource {
         this.settings.neckWidthUm = neckWidthUm;
     }
 
+    public void setRuleRegions(app.freerouting.settings.RuleRegionSettings[] ruleRegions) {
+        this.settings.ruleRegions = ruleRegions;
+    }
+
     public void setStrictDrc(boolean strictDrc) {
         this.settings.strictDrc = strictDrc;
     }

@@ -85,6 +85,15 @@ public class BasicBoard implements Serializable {
    * Handles the search trees pointing into the items of this board
    */
   public transient SearchTreeManager search_tree_manager;
+  /**
+   * Region-scoped rule overrides ({@link RuleRegion}), installed by the batch autorouter
+   * when {@code featureFlags.ruleRegions} is enabled and {@code router.rule_regions} is
+   * configured. {@code null} (the default, and always the state with the flag off) means no
+   * regions: every region-aware code path checks this for null first, so the flag-off
+   * behavior is unchanged. Not transient -- board snapshots taken for rollback (strict DRC,
+   * region retries) must restore the regions with the geometry.
+   */
+  public java.util.List<RuleRegion> rule_regions;
   private transient Set<Integer> normalizeSuppressedNetNos = new HashSet<>();
   private transient int revision = 0;
   /**
@@ -1215,11 +1224,84 @@ public class BasicBoard implements Serializable {
           }
         }
       }
+      if (is_obstacle && this.rule_regions != null && !default_tree.is_clearance_compensation_used()) {
+        // Region-scoped rules (v1 semantics, see rule_region_pair_clearance): the pair
+        // clearance is min(global, region) when either shape of the pair lies fully inside
+        // a rule region on this layer. The obstacle failed the global-clearance query above;
+        // re-check the pair at the region clearance (plus the same safety margin the query
+        // used) and drop it when the pair is legal there.
+        TileShape obstacle_shape = curr_item.get_tree_shape(default_tree, curr_tree_entry.shape_index_in_object);
+        int region_clearance = rule_region_pair_clearance(p_shape, obstacle_shape, p_layer);
+        if (region_clearance >= 0) {
+          double half_clearance = 0.5 * (region_clearance + app.freerouting.rules.ClearanceMatrix.clearance_safety_margin);
+          TileShape enlarged_shape = (TileShape) p_shape.enlarge(half_clearance);
+          TileShape enlarged_obstacle = (TileShape) obstacle_shape.enlarge(half_clearance);
+          if (!enlarged_shape.intersects(enlarged_obstacle)) {
+            is_obstacle = false;
+          }
+        }
+      }
       if (is_obstacle) {
         return false;
       }
     }
     return true;
+  }
+
+  /**
+   * Region scoping check for an ALREADY INSERTED trace (used by the batch autorouter's
+   * region retry): the index of the first tile shape that lies NOT fully inside p_region on
+   * the trace's layer and fails the insertability rules at p_clearance_class (normally the
+   * trace's global net-class clearance class), or -1 when every outside-region shape is
+   * globally legal. Shapes fully inside the region are skipped: the region rules governed
+   * them at insert time. The trace's own net(s) and its touching pins are transparent, the
+   * same rules as {@link #check_polyline_trace}.
+   */
+  public int first_trace_shape_outside_region_failing_global_rule(PolylineTrace p_trace,
+      RuleRegion p_region, int p_clearance_class) {
+    int[] net_no_arr = new int[p_trace.net_count()];
+    for (int n = 0; n < net_no_arr.length; n++) {
+      net_no_arr[n] = p_trace.get_net_no(n);
+    }
+    Set<Pin> contact_pins = p_trace.touching_pins_at_end_corners();
+    int layer = p_trace.get_layer();
+    for (int i = 0; i < p_trace.tile_shape_count(); i++) {
+      TileShape curr_shape = p_trace.get_tile_shape(i);
+      if (p_region.contains(curr_shape, layer)) {
+        continue;
+      }
+      if (!this.check_trace_shape(curr_shape, layer, net_no_arr, p_clearance_class, contact_pins)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Region-scoped rules: the smallest clearance override among the rule regions that apply
+   * on p_layer and fully contain AT LEAST ONE of the two shapes of the pair, or -1 when no
+   * region qualifies (or no regions are installed). This is the v1 pair rule from the
+   * roadmap ("checked shape fully inside the region box on that layer -> min(global,
+   * region)"), made symmetric in the pair so that {@link #check_trace_shape} (which checks
+   * one side) and {@link Item#clearance_violations()} (which visits the pair from both
+   * sides) always agree. Long items that straddle the region boundary can therefore be
+   * approached at region clearance by an item inside the region -- the fine-pitch use case
+   * (a wall of fixed copper reaching into the exception zone) -- while a pair with neither
+   * shape inside keeps the global rule.
+   */
+  public int rule_region_pair_clearance(TileShape p_shape_1, TileShape p_shape_2, int p_layer) {
+    if (this.rule_regions == null) {
+      return -1;
+    }
+    int result = -1;
+    for (RuleRegion region : this.rule_regions) {
+      if (region.contains(p_shape_1, p_layer) || region.contains(p_shape_2, p_layer)) {
+        if (result < 0 || region.clearance < result) {
+          result = region.clearance;
+        }
+      }
+    }
+    return result;
   }
 
   /**

@@ -45,6 +45,9 @@ class RoutingProfileTest {
     Freerouting.globalSettings.featureFlags.meanderMatching = Boolean.getBoolean("fr.meander");
     Freerouting.globalSettings.featureFlags.pairCorridorAffinity = Boolean.getBoolean("fr.pairaffinity");
     Freerouting.globalSettings.featureFlags.checkedRealizer = Boolean.getBoolean("fr.checked");
+    // -Dfr.regions takes a router.rule_regions JSON array (see RuleRegionSettings for the
+    // shape and units); its presence enables featureFlags.ruleRegions for the run.
+    Freerouting.globalSettings.featureFlags.ruleRegions = !System.getProperty("fr.regions", "").isBlank();
     InteractiveSettings.resetForTesting();
     scheduler = RoutingJobScheduler.getInstance();
     synchronized (scheduler.jobs) {
@@ -59,6 +62,11 @@ class RoutingProfileTest {
     settings.setMaxPasses(8);
     settings.setMaxItems(500);
     settings.setJobTimeoutString(System.getProperty("fr.timeout", "00:03:00"));
+    String regions_json = System.getProperty("fr.regions", "");
+    if (!regions_json.isBlank()) {
+      settings.setRuleRegions(app.freerouting.util.gson.GsonProvider.GSON.fromJson(
+          regions_json, app.freerouting.settings.RuleRegionSettings[].class));
+    }
 
     RoutingJob job = createRoutingJob(FIXTURE, settings);
     job.routerSettings.maxThreads = 1;
