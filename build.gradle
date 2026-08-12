@@ -469,10 +469,14 @@ tasks.withType(Test).configureEach { Test task ->
     // Forward the measurement-harness properties (-Dfr.fixture, -Dfr.timeout, -Dfr.partition, ...)
     // from the gradle invocation into the forked test JVMs. Gradle does not do this by itself,
     // so without the forwarding the probe/gate tests silently run their default fixture.
-    System.properties.each { k, v ->
-        if (k.toString().startsWith('fr.')) {
-            systemProperty k.toString(), v.toString()
-        }
+    // MUST go through the provider API: with org.gradle.configuration-cache=true, an eager
+    // System.properties.each is baked into the cache entry, and a later invocation with
+    // DIFFERENT -Dfr.* values silently replays the stale entry (measured: a -Dfr.fixture
+    // run reused a no-property entry and ran the default fixture flag-off). The provider
+    // registers the fr.* property set as a configuration input, so changes invalidate the
+    // cache entry instead of being ignored.
+    providers.systemPropertiesPrefixedBy('fr.').get().each { k, v ->
+        systemProperty k, v
     }
 
     testLogging {
