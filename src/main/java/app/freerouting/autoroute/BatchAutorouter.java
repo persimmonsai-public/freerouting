@@ -686,6 +686,8 @@ public class BatchAutorouter extends NamedAlgorithm {
     long drc_rejects_before = partition_drc_reject_count;
     // Iterate the deterministic connection list, not the identity-hashed map: commit order
     // changes outcomes (measured: three different final scores across identical runs).
+    this.commit_usage = usage;
+    try {
     for (NegotiationConn conn_key : conns) {
       PartitionRouter.CellRoute dry_route = routes.get(conn_key);
       if (dry_route == null) {
@@ -726,12 +728,18 @@ public class BatchAutorouter extends NamedAlgorithm {
       }
       AutorouteControl ctrl = new AutorouteControl(this.board, conn.net_no(), settings,
           this.settings.get_via_costs(), this.trace_cost_arr);
-      AutorouteAttemptResult result = try_partition_route(connected, unconnected, ctrl, -1);
+      // The airline feeds the per-commit diagnostics only (detour, board-diagonal fraction);
+      // it is the same minimum terminal-pair distance the per-item path measures.
+      AutorouteAttemptResult result = try_partition_route(connected, unconnected, ctrl,
+          airline_distance(unconnected, connected));
       if (result != null && result.state == AutorouteAttemptState.ROUTED) {
         ++committed;
       } else {
         ++attempt_failures;
       }
+    }
+    } finally {
+      this.commit_usage = null;
     }
     // NOTE (measured, both fixtures): retrying the DRC-rejected candidates with the
     // mirrored-dogleg/straighten repairs converts them mechanically, but every converted
@@ -747,8 +755,46 @@ public class BatchAutorouter extends NamedAlgorithm {
         + " already_connected=" + already_connected + " attempt_failures=" + attempt_failures
         + " attempt_drc_rejects=" + (partition_drc_reject_count - drc_rejects_before)
         + " checked_repairs=" + partition_checked_repair_count
+        + commit_policy_report()
         + live_channel_report()
         + " in " + (System.currentTimeMillis() - t0) + " ms");
+  }
+
+  /**
+   * The commit-policy counters, or the empty string when the flag is off (so flag-off log
+   * output stays byte-identical).
+   */
+  private String commit_policy_report() {
+    if (!isCommitPolicyEnabled()) {
+      return "";
+    }
+    return " policy_mode=" + COMMIT_POLICY_MODE
+        + " policy_declines=" + partition_policy_decline_count;
+  }
+
+  /**
+   * The minimum centre distance between the drill items of two connection sets -- the same
+   * airline {@code calc_airline} computes for the per-item path, without touching the
+   * autorouter's {@code air_line} field (the negotiation runs outside that state).
+   */
+  static double airline_distance(Collection<Item> p_from_items, Collection<Item> p_to_items) {
+    double min_square = Double.MAX_VALUE;
+    for (Item from_item : p_from_items) {
+      if (!(from_item instanceof DrillItem)) {
+        continue;
+      }
+      FloatPoint from_corner = ((DrillItem) from_item).get_center().to_float();
+      for (Item to_item : p_to_items) {
+        if (!(to_item instanceof DrillItem)) {
+          continue;
+        }
+        double distance = from_corner.distance_square(((DrillItem) to_item).get_center().to_float());
+        if (distance < min_square) {
+          min_square = distance;
+        }
+      }
+    }
+    return min_square == Double.MAX_VALUE ? -1 : Math.sqrt(min_square);
   }
 
   /**
@@ -1021,8 +1067,6 @@ public class BatchAutorouter extends NamedAlgorithm {
         ++partition_fallback_count;
         return null;
       }
-      board.pop_snapshot();
-      ++partition_routed_count;
       // Per-commit diagnostic (flag-gated paths only): the realized length against the
       // airline identifies which commit displaced what in an A/B unrouted-set diff.
       double located_length = 0;
@@ -1035,6 +1079,22 @@ public class BatchAutorouter extends NamedAlgorithm {
               .distance(located_trace.corners[i - 1].to_float());
         }
       }
+      // The feature vector is measured on the COMMITTED board (own-net completion is only
+      // observable after the connection exists) and before the snapshot is popped, so a
+      // declining policy can still roll the commit back.
+      CommitFeatures features = commit_features(route, p_ctrl, p_start_set, located_length,
+          p_airline_distance);
+      if (isCommitPolicyEnabled() && !commit_policy_accepts(features)) {
+        job.logInfo("[commit-policy] declined " + features);
+        board.undo(null);
+        partition_router.invalidate();
+        ++partition_policy_decline_count;
+        ++partition_fallback_count;
+        return null;
+      }
+      board.pop_snapshot();
+      ++partition_routed_count;
+      job.logInfo("[commit-feature] " + features);
       Net committed_net = board.rules.nets.get(p_ctrl.net_no);
       job.logInfo("[partition-commit] net=" + (committed_net != null ? committed_net.name : "?")
           + "(#" + p_ctrl.net_no + ") length=" + Math.round(located_length)
@@ -1068,6 +1128,171 @@ public class BatchAutorouter extends NamedAlgorithm {
    * bit-for-bit reproducible run-to-run -- see {@code autoroute_pass_parallel}'s javadoc).
    */
 
+
+  /**
+   * The commit-time feature vector of one partition-originated commit -- everything cheap
+   * that could plausibly discriminate an endgame-positive commit from an endgame-toxic one.
+   * Measured on the committed board (so {@link #completes_net} is an observation, not a
+   * prediction) and logged as {@code [commit-feature]} on every flag-gated commit, which is
+   * how the feature-vs-outcome table in docs/dense-bga-roadmap.md was built.
+   */
+  static final class CommitFeatures {
+    String net_name = "?";
+    int net_no;
+    /** Whether the net has NO unconnected terminal left after this commit. */
+    boolean completes_net;
+    /** Terminal (drill item) count of the committed net. */
+    int terminals;
+    double length;
+    double airline;
+    /** Realized length / airline, or -1 when the caller has no airline. */
+    double detour = -1;
+    /** Airline / board diagonal. */
+    double diagonal_ratio = -1;
+    int rooms;
+    /** Narrowest interior room capacity (min dimension / 6x compensated width). */
+    double min_capacity = -1;
+    /** Mean interior room capacity. */
+    double mean_capacity = -1;
+    /**
+     * How many OTHER dry routes of the negotiation round shared this route's interior rooms
+     * (sum over interior rooms of usage-1); -1 outside the negotiation commit phase.
+     */
+    int contention = -1;
+    /** Highest dry-route usage of any interior room; -1 outside the negotiation. */
+    int max_usage = -1;
+
+    @Override
+    public String toString() {
+      return "net=" + net_name + "(#" + net_no + ")"
+          + " completes=" + completes_net
+          + " terminals=" + terminals
+          + " length=" + Math.round(length)
+          + " airline=" + (airline > 0 ? String.valueOf(Math.round(airline)) : "?")
+          + " detour=" + (detour > 0 ? String.format("%.2f", detour) : "?")
+          + " diagfrac=" + (diagonal_ratio >= 0 ? String.format("%.3f", diagonal_ratio) : "?")
+          + " rooms=" + rooms
+          + " mincap=" + (min_capacity >= 0 ? String.format("%.2f", min_capacity) : "?")
+          + " meancap=" + (mean_capacity >= 0 ? String.format("%.2f", mean_capacity) : "?")
+          + " contention=" + contention
+          + " maxusage=" + max_usage;
+    }
+  }
+
+  /**
+   * Builds the {@link CommitFeatures} of a just-committed partition plan. Every input is
+   * either already in hand (the route, the realized length, the airline) or a single cheap
+   * board query, so the instrumentation is affordable on every commit.
+   */
+  private CommitFeatures commit_features(PartitionRouter.CellRoute p_route,
+      AutorouteControl p_ctrl, Set<Item> p_start_set, double p_located_length,
+      double p_airline_distance) {
+    CommitFeatures f = new CommitFeatures();
+    f.net_no = p_ctrl.net_no;
+    Net net = board.rules.nets.get(p_ctrl.net_no);
+    if (net != null) {
+      f.net_name = net.name;
+    }
+    f.length = p_located_length;
+    f.airline = p_airline_distance;
+    if (p_airline_distance > 0) {
+      f.detour = p_located_length / p_airline_distance;
+      IntBox bounds = board.get_bounding_box();
+      double diagonal = Math.hypot((double) bounds.ur.x - bounds.ll.x,
+          (double) bounds.ur.y - bounds.ll.y);
+      if (diagonal > 0) {
+        f.diagonal_ratio = p_airline_distance / diagonal;
+      }
+    }
+    for (Item item : board.get_connectable_items(p_ctrl.net_no)) {
+      if (item instanceof DrillItem) {
+        ++f.terminals;
+      }
+    }
+    f.completes_net = true;
+    for (Item item : p_start_set) {
+      f.completes_net = item.get_unconnected_set(p_ctrl.net_no).isEmpty();
+      break;
+    }
+    if (p_route != null && p_route.rooms != null) {
+      f.rooms = p_route.rooms.size();
+      int half_width = Math.max(1, p_ctrl.compensated_trace_half_width[p_route.layer]);
+      double capacity_sum = 0;
+      int interior = 0;
+      int contention = 0;
+      int max_usage = 0;
+      for (int i = 1; i + 1 < p_route.rooms.size(); i++) {
+        IntBox box = p_route.rooms.get(i).box;
+        int min_dim = Math.min(box.ur.x - box.ll.x, box.ur.y - box.ll.y);
+        double capacity = min_dim / (6.0 * half_width);
+        capacity_sum += capacity;
+        if (f.min_capacity < 0 || capacity < f.min_capacity) {
+          f.min_capacity = capacity;
+        }
+        ++interior;
+        if (commit_usage != null) {
+          int usage = commit_usage.getOrDefault(PartitionRouter.box_key(box), 0);
+          contention += Math.max(0, usage - 1);
+          max_usage = Math.max(max_usage, usage);
+        }
+      }
+      if (interior > 0) {
+        f.mean_capacity = capacity_sum / interior;
+      }
+      if (commit_usage != null) {
+        f.contention = contention;
+        f.max_usage = max_usage;
+      }
+    }
+    return f;
+  }
+
+  /**
+   * The commit-acceptance predicate (featureFlags.commitPolicy). The shipped predicate is
+   * {@code capacity} -- corridor slack: accept a commit only when every interior room of its
+   * route still has capacity for another trace of the same width. {@code -Dfr.commitpolicy.mode}
+   * selects a different predicate for measurement runs ({@code completes}: the banked own-net
+   * completion signature, MEASURED AND REFUTED -- see docs/dense-bga-roadmap.md; {@code slack}:
+   * both; {@code contention}: completion plus an uncontended negotiation corridor); it is a
+   * diagnostic override, not a supported setting.
+   */
+  static boolean commit_policy_accepts(CommitFeatures p_features, String p_mode) {
+    return switch (p_mode) {
+      case "completes" -> p_features.completes_net;
+      case "contention" -> p_features.completes_net && p_features.contention <= 0;
+      case "slack" -> p_features.completes_net && p_features.min_capacity >= MIN_COMMIT_CAPACITY;
+      default -> p_features.min_capacity >= MIN_COMMIT_CAPACITY;
+    };
+  }
+
+  private boolean commit_policy_accepts(CommitFeatures p_features) {
+    return commit_policy_accepts(p_features, COMMIT_POLICY_MODE);
+  }
+
+  /**
+   * The corridor-slack threshold: an interior room admits a second trace of the committed
+   * width when its narrow dimension exceeds six compensated half widths (the negotiation's
+   * own room capacity formula), so {@code min_capacity >= 1} means every room the commit
+   * passes through still has room for someone else.
+   */
+  static final double MIN_COMMIT_CAPACITY = 1.0;
+
+  private static final String COMMIT_POLICY_MODE =
+      System.getProperty("fr.commitpolicy.mode", "capacity");
+
+  private boolean isCommitPolicyEnabled() {
+    return app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.commitPolicy;
+  }
+
+  private long partition_policy_decline_count;
+
+  /**
+   * The negotiation round's dry-route room usage, published for the duration of the commit
+   * phase so {@link #commit_features} can price corridor contention; null everywhere else
+   * (the per-item quality-mode path has no dry-route round).
+   */
+  private Map<String, Integer> commit_usage;
 
   /**
    * Partition-based single-layer router (docs/free-space-partition.md stage 2), created on

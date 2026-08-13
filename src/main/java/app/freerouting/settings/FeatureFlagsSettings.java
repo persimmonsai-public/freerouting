@@ -129,6 +129,24 @@ public class FeatureFlagsSettings implements Serializable {
    * cheaply. Only affects partition/negotiation plans. Default off.
    */
   public boolean liveChannelValidation = false;
+  /**
+   * Commit-acceptance policy for partition-originated commits (docs/dense-bga-roadmap.md,
+   * failure class 3 "endgame-toxic-but-legal"): a legal, DRC-clean partition/negotiation
+   * commit is additionally required to pass a commit-time predicate, and a commit that fails
+   * it is rolled back from the commit snapshot so the classic engine routes the connection
+   * instead. The wired predicate is corridor slack -- every interior room of the committed
+   * route must still have capacity for another trace of the same width.
+   *
+   * <p><b>Measured verdict: the predicate does not separate endgame-positive from
+   * endgame-toxic commits</b> (docs/dense-bga-roadmap.md, commit-acceptance policy). Neither
+   * this predicate nor the banked own-net-completion signature ({@code -Dfr.commitpolicy.mode
+   * =completes}) orders the measured commits: bm11's only PAYING commit and bm05's diagnosed
+   * TOXIC commit have near-identical feature vectors and are declined by both. The mechanism
+   * (commit-time feature vector + snapshot rollback) is kept as the instrument the lookahead
+   * policy will need; the classification is unsolved. Only affects partition/negotiation
+   * plans. Default off, and not recommended for default on.
+   */
+  public boolean commitPolicy = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")

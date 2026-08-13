@@ -1158,3 +1158,145 @@ unrouted set; flag-on bm01 negotiation **979.47/4/0** 2/2 and bm04 negotiation
 **986.01/2/0** 2/2; `LiveChannelValidationTest` covers the channel geometry (containment in
 the plan's channel, both crossing points kept, the erosion margin where the channel allows
 it, the per-axis collapse) over randomized boxes; autoroute + settings unit suites green.
+
+## Commit-acceptance policy: the mechanism ships, the predicate is REFUTED (2026-08-12)
+
+The live-channel increment ended with one condition for making it a default: "an acceptance
+policy that can decline the bm01-shaped commits". That policy was built, instrumented and
+measured. **The mechanism works and the classification does not**: no commit-local feature
+measured on these boards separates endgame-positive from endgame-toxic commits, and the two
+candidate predicates each invert on at least one fixture.
+
+**What was built.** `featureFlags.commitPolicy` (`-Dfr.commitpolicy`, default off): after a
+partition/negotiation commit has passed materialization, live-channel validation and the
+pre-insert DRC, the commit is measured on the committed board and, if the predicate declines
+it, rolled back through the commit snapshot (`board.undo`, the same path a mid-chain insert
+failure already took) so the classic engine routes the connection instead. The predicate
+input is a `[commit-feature]` vector logged on EVERY flag-gated commit -- own-net completion
+(does the net have unconnected terminals left after this commit), terminal count, realized
+length, airline, detour, airline/board-diagonal fraction, room count, min/mean interior room
+capacity (the negotiation's own `min_dim / 6*half_width`), and -- in the negotiation commit
+phase -- the corridor contention (how many other dry routes of the final round used the same
+interior rooms) and the peak room usage. The negotiation commit path now also computes its
+airline (the same minimum terminal-pair distance the per-item path uses), so detour is no
+longer "?" there. `-Dfr.commitpolicy.mode` selects the predicate for measurement runs
+(`capacity` shipped, `completes`, `slack`, `contention`).
+
+**The measured feature-vs-outcome table** (every row is a `[commit-feature]` line of a
+flag-on run; "outcome" is the board-level A/B the commit set belongs to):
+
+| board / config | net | completes | terms | detour | diagfrac | mincap | meancap | cont | outcome of that commit set |
+|---|---|---|---|---|---|---|---|---|---|
+| bm01 neg (champion 994.85/1) | PL7 | yes | 3 | 1.34 | 0.357 | 2.71 | 2.87 | 1 | **+1 net** vs 989.72/2 |
+| bm01 neg (champion) | VIN | yes | 7 | 2.14 | 0.192 | 0.46 | 1.64 | 0 | **+1 net** |
+| bm01 neg (champion) | PB5 | yes | 3 | 1.26 | 0.254 | 0.40 | 0.58 | 0 | **+1 net** |
+| bm01 neg+LC (979.47/4) | PC6 | yes | 3 | 1.18 | 0.320 | 0.68 | 2.31 | 0 | **-3 nets** vs champion |
+| bm01 neg+LC | ADC9 | yes | 3 | 1.32 | 0.368 | 0.83 | 4.83 | 0 | -3 nets |
+| bm01 neg+LC | VIN | yes | 7 | 1.23 | 0.192 | 0.64 | 0.64 | 0 | -3 nets |
+| bm01 neg+LC | ADC12 | yes | 3 | 1.44 | 0.402 | 0.49 | 0.58 | 0 | -3 nets |
+| bm01 neg+LC | PB6 | yes | 3 | 1.22 | 0.261 | 1.36 | 1.36 | 0 | -3 nets |
+| bm01 neg+LC | PB5 | yes | 3 | 1.24 | 0.254 | 0.40 | 1.34 | 0 | -3 nets |
+| bm01 neg+LC | PB1 | **no** | 4 | 2.44 | 0.172 | 0.68 | 1.73 | 0 | -3 nets |
+| bm04 neg+LC (986.01/2) | Net-(C14-Pad2) | yes | 5 | 1.53 | 0.572 | 1.32 | 1.32 | 0 | **+1 net** vs 979.01/3 |
+| bm04 neg+LC | /PE3 | yes | 5 | 1.76 | 0.345 | 1.57 | 1.69 | 0 | +1 net |
+| bm04 neg+LC | /TX1 | yes | 3 | 2.14 | 0.340 | 1.67 | 1.83 | 0 | +1 net |
+| bm05 part (794.39/22) | /XADUIO_SCL | **yes** | 4 | 1.97 | 0.287 | 0.38 | 0.56 | n/a | **-4 nets** (the diagnosed toxic commit) |
+| bm05 part+LC (813.08/20) | /3.3VDD | **no** | 10 | 1.92 | 0.318 | 1.27 | 1.61 | n/a | **+2 nets** vs 794.39/22 |
+| bm05 part+LC | /IN1P | **no** | 6 | 1.91 | 0.386 | 0.78 | 2.60 | n/a | +2 nets |
+| bm05 part+LC | /IN2P | yes | 5 | 1.61 | 0.272 | 1.13 | 1.20 | n/a | +2 nets |
+| bm05 part+LC | /XAUDIO_IRQ | yes | 3 | 1.15 | 0.328 | 0.38 | 1.94 | n/a | +2 nets |
+| bm05 part+LC | /XADUIO_SCL | yes | 4 | 2.00 | 0.287 | 0.38 | 0.56 | n/a | +2 nets |
+| bm05 part+LC | /XADUIO_I2S0_LRCKL | yes | 3 | 1.79 | 0.299 | 7.23 | 7.23 | n/a | +2 nets |
+| bm05 part+LC | /IN2P | yes | 5 | 1.95 | 0.272 | 0.88 | 1.08 | n/a | +2 nets |
+| bm05 neg+LC (822.42/19) | /IN1P | **no** | 6 | 1.58 | 0.386 | 5.59 | 5.59 | 1 | **-1 net** vs 831.77/18 |
+| bm05 neg+LC | /LOUTR | yes | 4 | 1.53 | 0.262 | 2.38 | 3.84 | 2 | -1 net |
+| bm11 neg+LC (987.49/2) | /PWM3 | **no** | 6 | 2.16 | 0.272 | 0.42 | 0.42 | 0 | **+1 net** vs 981.24/3 |
+
+**Predicate 1 -- the banked own-net completion signature: REFUTED, twice over.**
+
+- It does not even hold on the board it was banked from. bm05's diagnosed toxic commit
+  (/XADUIO_SCL, the 1.97x detour that costs 4 nets) **completes its own net at commit time**;
+  the incompleteness the diagnosis saw is an END-OF-RUN observation -- the net is committed
+  whole and ripped up later. The signature is real as a post-mortem and false as a predicate.
+- Where it does fire, it fires on the wrong commits. bm11's ONLY paying commit (/PWM3, +1
+  net) is `completes=false`, and so is /3.3VDD, which is in bm05 partition mode's +2-net
+  chain. Declining them costs exactly those nets.
+- Measured: bm01 neg+LC 979.47/4 -> **979.47/4** (declines PB1, the one incomplete commit;
+  score unchanged, the four toxic commits all pass); bm05 partition+LC 813.08/20 ->
+  **794.39/22** (-2 nets); bm05 negotiation+LC 822.42/19 -> **831.77/18** (+1 net, but by
+  suppressing ALL commits -- the flag-off score); bm11 neg+LC 987.49/2 -> **981.24/3** (-1
+  net, again by suppressing the only commit); bm04 neg+LC **986.01/2 unchanged** (0 declines,
+  all three commits complete their nets).
+
+**Predicate 2 -- corridor slack (`mincap >= 1`, every interior room of the route still wide
+enough for another trace of the same width): REFUTED.** It is the local form of the
+congestion law, and it is the best of the measured predicates on the champion board -- and it
+still loses. bm01 neg+LC 979.47/4 -> **984.60/3** (4 declines, and the declines shift the
+trajectory: a commit that never existed before, ADC10, appears and is accepted), which is
+still 1 net below the 989.72/2 flag-off baseline and 2 below the champion. bm04 **986.01/2
+unchanged** (0 declines). bm05 negotiation+LC **822.42/19 unchanged** (0 declines). And it
+inverts on the other two: bm05 partition+LC 813.08/20 -> **785.04/23** (-3 nets, even though
+it correctly declines the diagnosed toxic /XADUIO_SCL) and bm11 987.49/2 -> **981.24/3**
+(declines the paying commit, mincap 0.42).
+
+**Predicate 3 -- corridor contention: refuted by the champion's own vector, without a run.**
+Every bm01 commit under live-channel validation has `contention=0`; the champion commit PL7
+has `contention=1, maxusage=2`. A contention gate declines a beneficial commit and accepts
+every toxic one -- the feature is anti-correlated with value on the only board where both
+classes are observed.
+
+**Board-level slack gating does not survive the same table either.** The obvious cheap board
+proxies are the corridor capacities themselves, and they order the boards backwards: bm11 --
+the board where a commit PAYS -- has the tightest corridor of all four commit sets (mincap
+0.42, meancap 0.42), while bm05 partition mode, where commits cost nets against flag-off, has
+capacities up to 7.23. And a board gate cannot meet the criterion anyway: bm01's champion
+994.85/1 is PRODUCED by three commits on the most congested board in the set, so "no commits
+where the board is congested" costs that board a net by construction.
+
+**Full flag matrix** (score / unrouted, 0 violations in every cell; policy always composed
+with `-Dfr.livechannel`):
+
+| config | livechannel off | +livechannel | +policy `completes` | +policy `capacity` (shipped) |
+|---|---|---|---|---|
+| bm01 negotiation (+negpar) | **994.85/1** | 979.47/4 | 979.47/4 (1 decline) | 984.60/3 (4 declines) |
+| bm04 negotiation (+negpar), 10 min | 979.01/3 | **986.01/2** | 986.01/2 (0 declines) | **986.01/2** (0 declines) |
+| bm05 partition quality mode | 794.39/22 (831.77/18 all-off) | **813.08/20** | 794.39/22 (1 decline) | 785.04/23 (4 declines) |
+| bm05 negotiation | 822.42/19 (831.77/18 all-off) | 822.42/19 | **831.77/18** (1 decline, 0 commits) | 822.42/19 (0 declines) |
+| bm11 negotiation | 987.49/2 | 987.49/2 | 981.24/3 (1 decline) | 981.24/3 (1 decline) |
+
+Every cell of the last three columns was measured in this increment; the `livechannel off`
+column is re-measured here for bm01 (994.85/1, champion counters) and carried from the live
+channel increment for the other four rows.
+
+**The success criterion is NOT met.** It asked for bm01 negotiation to hold 994.85/1/0 with
+both flags on while bm04 keeps 986.01/2 and bm05 partition keeps 813.08/20. The best measured
+policy holds bm04 and gets bm01 to 984.60/3 -- 2 nets short -- while giving up bm05 partition
+and bm11. **Live channel validation therefore stays default off, and so does the commit
+policy.** No default flip is recommended.
+
+**What the refutation actually says.** Declining a commit is not filtering; it is choosing a
+different trajectory. Every decline changes which candidates the remaining connections
+produce (bm01 grows a new commit, ADC10, that no other configuration ever attempted; bm05
+partition's whole commit sequence re-orders after one decline), so the value of a commit is
+not a property of the commit -- it is a property of the trajectory it starts. That is the
+endgame-compatibility law's sixth measurement and its sharpest form: two commits with the
+same banked signature (`completes=false`, multi-terminal, ~2x detour) sit on bm11 and bm05
+negotiation, and suppressing the first costs a net while suppressing the second gains one.
+**The honest conclusion is that commit acceptance needs a LOOKAHEAD -- trial-commit, route
+the pass, measure, keep or roll back -- not a commit-local predicate.** The machinery this
+increment ships is exactly what such a lookahead needs (feature vector at commit time,
+snapshot rollback of an accepted commit, per-decline logging); the classifier is what does
+not exist. A trial-commit lookahead costs a pass per candidate at maxItems 500, which is why
+it was not attempted here, and it is now the shaped follow-up.
+
+**Verification.** Flag-off gates EXACT: bm01 **989.72/2/0** (unrouted {ADC12, TXD1}); bm05
+2-min **831.77/18/0**; bm04 10-min **979.01/3/0** (unrouted {/PB7, /PB6, /MOSI}); bm01
+negotiation champion **994.85/1/0** with the champion counters (committed=3,
+attempt_drc_rejects=13). Determinism: bm01 negotiation with both flags on is **2/2 identical**
+-- 984.60/3/0, the same unrouted set {ADC4, SDA, RXD1}, the same four declines in the same
+order and identical counters (committed=2, policy_declines=4, attempt_drc_rejects=5,
+live_plans=11, live_plan_rejects=1, live_occupied_channels=1, live_stale_channels=0,
+live_shrinks=41). `CommitPolicyTest` pins the predicate against the measured feature vectors
+(it fails if the shipped predicate stops declining bm05's diagnosed toxic commit or starts
+declining bm04's three paying ones, and it encodes the two refutations as assertions); full
+non-slow unit suite green.
