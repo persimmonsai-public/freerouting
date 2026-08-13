@@ -1476,3 +1476,147 @@ plus live channel validation, both **465.13/55/538**. `PairedRoutingTest` (misma
 determinism, and the forced-rollback atomicity proof) and `PairedRouterGeometryTest` (constant
 offset distance through 45- and 90-degree corners, direction preservation, hairpin refusal,
 45-degree fan-in legality) are new; full non-slow unit suite green.
+
+## Trial-commit lookahead: the criterion is MET, and the probe had to be exact (2026-08-12)
+
+The commit-acceptance increment refuted every commit-local predicate and concluded that "commit
+acceptance needs a LOOKAHEAD -- trial-commit, route the pass, measure, keep or roll back". That
+was built and measured. **It works: all four gate boards hit their targets at once, which no
+predicate came close to.** Two things had to be right first, and both were measured rather
+than assumed: the probe has to be EXACT (an undo-based one is not), and the horizon has to be
+the whole remaining RUN (a one-pass horizon is a precise measurement of the wrong thing).
+
+**What was built.** `featureFlags.commitLookahead` (`-Dfr.lookahead`, default off). At a
+candidate partition/negotiation commit -- after materialization, live-channel validation and
+the pre-insert DRC, at the same point the commit policy hooks -- the router routes the same
+bounded horizon twice and keeps the candidate only if its horizon ends with no more incomplete
+connections than declining it does:
+
+- **Trial B (decline)** runs first, before the commit exists, from the board as it stands.
+- **Trial A (accept)** runs after `commit_connection` and after the post-commit pull-tight
+  (brought forward inside the commit snapshot so the probed board is the board the pass would
+  actually continue from). A declined candidate is rolled back through the existing
+  snapshot/`undo` bracket; an accepted one is never rolled back and re-applied, which is why
+  the decline trial goes first -- re-committing a plan onto an undone board would hand
+  `InsertFoundConnectionAlgo` start/target `Item` references that undo has replaced.
+- The compared outcome is the board's **incomplete-connection count**, minimised over the
+  horizon's passes (the router is scored on the best board it reaches, so the probe is too).
+  A connectivity metric, not a geometric one, so the 1000 ms wall-clock pull-tight limit
+  cannot leak into the comparison.
+- Knobs, all measurement instruments: `-Dfr.lookahead.passes` (horizon length, default 8 =
+  the remaining run), `-Dfr.lookahead.k` (bound the horizon to K connections),
+  `-Dfr.lookahead.margin` (default 2, see below), `-Dfr.lookahead.tie`,
+  `-Dfr.lookahead.repeat` and `-Dfr.lookahead.pulltight` (the two diagnostics below).
+
+**REFUTATION 1 -- the snapshot/undo probe restores every last piece of copper and is still not
+the same experiment twice.** The obvious mechanism, and the one the previous increment assumed
+was already in hand, is `generate_snapshot` / route / `undo`. A canonical copper digest (every
+trace and via as net/layer/corners, sorted) says it restores **exactly**: `restored` on every
+probe of every run. It is still wrong. Running the IDENTICAL probe three times from the
+IDENTICAL board:
+
+| board | probe 1 | probe 2 | probe 3 |
+|---|---|---|---|
+| bm01 `431/1494231b` | 47 | 54 | 49 |
+| bm01 `431/1494231b` (next candidate, same board) | 52 | 48 | 50 |
+| bm01 `433/35fc808e` | 49 | 45 | 49 |
+| bm01 `435/78cc21bb` | 61 | 50 | 48 |
+
+A spread of up to 13 incompletes while the effect being measured is 1 net. Two hypotheses were
+tested and both REFUTED, each by a run that came out **bit-identical** to the one before it:
+removing the wall-clock pull-tight deadline inside probes (`-Dfr.lookahead.pulltight=0`)
+changed nothing, so it is not a timing artifact; rewinding the item-id counter as part of the
+rollback changed nothing either, so it is not id drift. The residue is the board's own internal
+structure -- the search trees are rebuilt item by item in the order `undo` restores them.
+`BasicBoard.readObject` instead rebuilds them from the canonical item order, so **the shipped
+probe routes a deserialized CLONE and never touches the live board at all**. Repeats then agree
+exactly (50/50/50, 47/47/47, 44/44/44), and two candidates probing the same board get the same
+number. The copper digest is kept as a live assertion that the live board comes out untouched.
+
+**THE COST MODEL** (measured, and it is simpler than feared): with a full-run horizon **one
+probe costs about one full router run**, so the lookahead costs `2 x N_candidates` runs.
+
+| board | candidates | probes | lookahead time | per probe | run without / with |
+|---|---|---|---|---|---|
+| bm01 negotiation+LC | 8 | 16 | 416.3 s | 26.0 s | 37.9 s / 460 s |
+| bm04 negotiation+LC | 3 | 6 | 351.3 s | 58.6 s | 70.9 s / 420 s |
+| bm05 partition+LC | 7 | 14 | 200.7 s | 14.3 s | 17.6 s / 215 s |
+| bm11 negotiation+LC | 1 | 2 | 20.3 s | 10.1 s | 20 s / 39 s |
+
+Candidate counts are small because the span and cleanliness filters have already run: the
+lookahead only ever sees commits that were going to happen. A one-pass horizon costs 4.0 s per
+probe on bm01 (6.5x cheaper) -- and is not worth having, see below. None of the gate boards is
+budget-limited at these budgets (bm04 finishes its 8 passes in 71 s of its 10-minute budget),
+so the extra time is extra wall-clock, not routing taken away from the board; the runs above
+were given a 60-minute budget and the flag-off/livechannel numbers are unchanged by that.
+
+**REFUTATION 2 -- the horizon must be the whole remaining run.** A one-pass horizon is cheap,
+exact, and measures the wrong quantity: it optimises pass-1 incompletes, which is not what the
+run is scored on.
+
+| horizon (bm01 negotiation+LC+lookahead) | per probe | result |
+|---|---|---|
+| 1 pass | 4.0 s | **958.95/8** -- worse than livechannel alone (979.47/4) and worse than flag-off |
+| 8 passes (the remaining run) | 26.0 s | **994.85/1** -- the champion, held |
+
+The one-pass horizon's own numbers show why: it resolves accept-vs-decline differences of 2-8
+incompletes confidently and they simply do not survive to pass 8. The board-level evidence
+agreed all along -- the champion (3 commits) ends pass 1 at 51 unrouted and the live-channel
+configuration (7 commits) at 52, a 1-net difference that grows to 3 by the end.
+
+**COMPLEMENTARITY, and the one fitted constant.** With the strict rule (keep only what the
+horizon does not show losing) three of four boards hit their targets and **bm04 falls to
+972.02/4, below its own flag-off 979.01/3**. The log says exactly why. All three bm04
+candidates are probed from the same board `378/962ed35a`, each against a decline-all
+continuation of 3: they score **5, 5 and 2**. Committing all three actually gives 986.01/2. No
+member of that chain pays alone, so a greedy rule kills it at the first member -- and with the
+margin, the SECOND candidate, now probed from the board that already carries the first commit,
+flips to **accept=3 vs decline=5**, a 2-net gain. This is the structural limit of a greedy
+trial-commit lookahead: each candidate is evaluated against a continuation in which no LATER
+candidate commits, so commit sets that only pay together are invisible to it. `-Dfr.lookahead
+.margin` (default **2**, the largest single-commit loss the measured complementary chains show)
+is the cheap answer, and it is honestly a constant fitted to four boards whose generalization
+is unmeasured -- the campaign's own catalogue of tuned thresholds says to distrust it. The
+exact answer is a search over commit SETS (2^3 on bm04, 2^17 on bm01), which is the shaped
+follow-up.
+
+**Full flag matrix** (score / unrouted, 0 violations in every cell; lookahead always composed
+with `-Dfr.livechannel`):
+
+| config | livechannel off | +livechannel | +lookahead, margin 0 | +lookahead, shipped (margin 2) |
+|---|---|---|---|---|
+| bm01 negotiation (+negpar) | **994.85/1** | 979.47/4 | **994.85/1** | **994.85/1** |
+| bm04 negotiation (+negpar) | 979.01/3 | **986.01/2** | 972.02/4 | **986.01/2** |
+| bm05 partition quality mode | 794.39/22 (831.77/18 all-off) | **813.08/20** | **813.08/20** | **813.08/20** |
+| bm11 negotiation | 987.49/2 | 987.49/2 | **987.49/2** | **987.49/2** |
+
+**THE SUCCESS CRITERION IS MET.** It asked for bm01 negotiation >= 994.85/1 AND bm04 >=
+986.01/2 AND bm05 partition >= 813.08/20 with the live-channel gains kept. The shipped
+configuration delivers all three, plus bm11 at parity with its best known number. The decisions
+are the ones no commit-local predicate could make: on bm11 the lookahead **keeps** the single
+paying commit that own-net completion, corridor slack and contention all decline (accept=2 vs
+decline=3); on bm01 it declines four commits that are 4-8 incompletes worse and keeps two worth
+10 and 3, reproducing the champion from a configuration that scores 979.47/4 without it.
+
+**Recommendation on defaults: `liveChannelValidation` and `commitLookahead` should become
+defaults TOGETHER, and neither alone** -- live channel validation on its own still costs bm01
+3 nets, and the lookahead exists to pay that back. Two things argue for waiting, and both are
+measurable: the ~6-12x wall-clock cost, which is a real change in what the router is for at
+default settings, and the fitted margin. **Defaults are not flipped here** (campaign rule: the
+increment that measures a default flip does not perform it).
+
+**Verification.** Flag-off gates EXACT on the final code, to the board hash: bm01
+**989.72/2/0** (unrouted {ADC12, TXD1}, board `d392b5238df027abc1a3fb26054553b8`, identical to
+the pre-change run); bm01 negotiation champion **994.85/1/0** with the champion counters
+(committed=3, attempt_drc_rejects=13, board `99a806640164088bc042d9a8aee396b1`); bm05 2-min
+**831.77/18/0**; bm04 10-min **979.01/3/0** (unrouted {/PB7, /PB6, /MOSI}). Determinism: bm01
+negotiation with `-Dfr.livechannel -Dfr.lookahead` at the shipped defaults is **2/2 identical**
+-- 994.85/1/0, unrouted {ADC14}, all eight `[lookahead]` decisions identical line for line, and
+identical counters (committed=5, lookahead_probes=16, lookahead_accepts=5, lookahead_declines=3,
+lookahead_ties=1, attempt_drc_rejects=7, live_plans=15, live_shrinks=61). The final board HASH
+differs between the two runs, which is the pre-existing pull-tight wall-clock variance the bm05
+diagnosis documented, not a lookahead effect -- score, unrouted set, violations and every
+counter are identical. `CommitLookaheadTest` pins the decision rule against the measured horizon
+pairs (it fails if the rule stops keeping bm11's paying commit, stops declining bm01's toxic
+ones, or loses bm04's complementary chain, and it encodes the zero-margin refutation as an
+assertion); full non-slow unit suite green.

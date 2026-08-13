@@ -48,6 +48,7 @@ class RoutingProfileTest {
     Freerouting.globalSettings.featureFlags.checkedRealizer = Boolean.getBoolean("fr.checked");
     Freerouting.globalSettings.featureFlags.liveChannelValidation = Boolean.getBoolean("fr.livechannel");
     Freerouting.globalSettings.featureFlags.commitPolicy = Boolean.getBoolean("fr.commitpolicy");
+    Freerouting.globalSettings.featureFlags.commitLookahead = Boolean.getBoolean("fr.lookahead");
     // -Dfr.regions takes a router.rule_regions JSON array (see RuleRegionSettings for the
     // shape and units); its presence enables featureFlags.ruleRegions for the run.
     Freerouting.globalSettings.featureFlags.ruleRegions = !System.getProperty("fr.regions", "").isBlank();

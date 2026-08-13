@@ -10,6 +10,7 @@ import app.freerouting.board.ConductionArea;
 import app.freerouting.board.Connectable;
 import app.freerouting.board.DrillItem;
 import app.freerouting.board.Item;
+import app.freerouting.board.ItemIdentificationNumberGenerator;
 import app.freerouting.board.Pin;
 import app.freerouting.board.PolylineTrace;
 import app.freerouting.board.RoutingBoard;
@@ -274,8 +275,18 @@ public class BatchAutorouter extends NamedAlgorithm {
   private List<Item> getAutorouteItems(RoutingBoard board) {
     // Reuse instance collections to reduce memory allocation
     reusable_autoroute_item_list.clear();
+    return getAutorouteItems(board, reusable_autoroute_item_list);
+  }
+
+  /**
+   * As above, but collects into the caller's list. The no-argument form reuses one instance
+   * collection, which a caller that runs WHILE that list is being iterated (the trial-commit
+   * lookahead probes inside a pass) would clear out from under the iteration -- those callers
+   * pass their own list instead.
+   */
+  private List<Item> getAutorouteItems(RoutingBoard board, List<Item> p_target) {
     reusable_handled_items.clear();
-    List<Item> autoroute_item_list = reusable_autoroute_item_list;
+    List<Item> autoroute_item_list = p_target;
     Set<Item> handled_items = reusable_handled_items;
     Iterator<UndoableObjects.UndoableObjectNode> it = board.item_list.start_read_object();
     for (;;) {
@@ -757,6 +768,7 @@ public class BatchAutorouter extends NamedAlgorithm {
         + " checked_repairs=" + partition_checked_repair_count
         + commit_policy_report()
         + live_channel_report()
+        + lookahead_report()
         + " in " + (System.currentTimeMillis() - t0) + " ms");
   }
 
@@ -1057,6 +1069,32 @@ public class BatchAutorouter extends NamedAlgorithm {
       }
       AutorouteEngine commit_engine = new AutorouteEngine(board, tree, false);
       AutorouteEngine.ConnectionPlan plan = AutorouteEngine.ConnectionPlan.found(located, null);
+      // Trial-commit lookahead, trial B (DECLINE): the horizon from the board WITHOUT this
+      // candidate. Measured before the commit exists so both trials read a board the router
+      // actually reached. A probe needs a pass to be under way and must not recurse.
+      boolean lookahead = isCommitLookaheadEnabled() && !this.in_lookahead
+          && this.lookahead_pass_active && !this.thread.is_stop_auto_router_requested();
+      int decline_incompletes = -1;
+      String pre_probe_hash = null;
+      String post_probe_hash = null;
+      if (lookahead) {
+        // The probe routes a clone, so the live board must come out untouched; both digests
+        // are logged so any leak is visible in the log rather than silently poisoning the
+        // next candidate's baseline.
+        pre_probe_hash = copper_digest();
+        decline_incompletes = lookahead_probe();
+        // Repeatability experiment (-Dfr.lookahead.repeat=N, measurement only): re-run the
+        // SAME probe on the SAME board N-1 more times. If the horizon is a function of the
+        // board, every repeat agrees; the spread of these numbers is the resolution limit of
+        // the whole mechanism. The first value is still the one the decision uses, so the
+        // experiment does not change any decision.
+        for (int repeat = 1; repeat < LOOKAHEAD_REPEAT; repeat++) {
+          job.logInfo("[lookahead-repeat] net=" + p_ctrl.net_no + " decline#" + (repeat + 1)
+              + "=" + lookahead_probe() + " (first=" + decline_incompletes
+              + ", board=" + pre_probe_hash + ")");
+        }
+        post_probe_hash = copper_digest();
+      }
       // The pre-check above makes insert failure rare; the snapshot is a safety net so a
       // residual mid-chain insert failure cannot leave a partial connection on the board.
       board.generate_snapshot();
@@ -1092,6 +1130,36 @@ public class BatchAutorouter extends NamedAlgorithm {
         ++partition_fallback_count;
         return null;
       }
+      // Trial-commit lookahead, trial A (ACCEPT): the same horizon from the committed board.
+      // The post-commit pull-tight the real path runs at the end is brought forward to here so
+      // the probed board is the board the pass would actually continue from; it sits inside the
+      // commit snapshot, so a rolled-back commit takes its pull-tight with it.
+      if (lookahead) {
+        board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy,
+            p_ctrl.trace_costs, this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+        int accept_incompletes = lookahead_probe();
+        boolean tie = accept_incompletes == decline_incompletes + LOOKAHEAD_MARGIN;
+        boolean keep = lookahead_keeps(accept_incompletes, decline_incompletes,
+            LOOKAHEAD_MARGIN, LOOKAHEAD_TIE);
+        if (tie) {
+          ++lookahead_tie_count;
+        }
+        job.logInfo("[lookahead] net=" + p_ctrl.net_no
+            + " horizon_incompletes accept=" + accept_incompletes
+            + " decline=" + decline_incompletes
+            + (tie ? " (tie)" : "") + " -> " + (keep ? "keep" : "roll back")
+            + " board=" + pre_probe_hash
+            + (pre_probe_hash != null && pre_probe_hash.equals(post_probe_hash)
+                ? " restored" : " RESTORE-MISMATCH=" + post_probe_hash));
+        if (!keep) {
+          board.undo(null);
+          partition_router.invalidate();
+          ++lookahead_decline_count;
+          ++partition_fallback_count;
+          return null;
+        }
+        ++lookahead_accept_count;
+      }
       board.pop_snapshot();
       ++partition_routed_count;
       job.logInfo("[commit-feature] " + features);
@@ -1102,8 +1170,11 @@ public class BatchAutorouter extends NamedAlgorithm {
           + " detour=" + (p_airline_distance > 0
               ? String.format("%.2f", located_length / p_airline_distance) : "?"));
       partition_router.invalidate();
-      board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, p_ctrl.trace_costs,
-          this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+      if (!lookahead) {
+        // Already done above when the lookahead ran, so the accept probe could see it.
+        board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, p_ctrl.trace_costs,
+            this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+      }
       return result;
     } catch (Exception e) {
       FRLogger.error("PartitionRouter attempt failed; falling back to the classic engine", e);
@@ -1287,6 +1358,253 @@ public class BatchAutorouter extends NamedAlgorithm {
 
   private long partition_policy_decline_count;
 
+  // ---------------------------------------------------------------------------------------
+  // Trial-commit lookahead (featureFlags.commitLookahead, -Dfr.lookahead)
+  //
+  // The commit-acceptance increment REFUTED every commit-local predicate and concluded that a
+  // commit's value is a property of the TRAJECTORY it starts, not of the commit. So this does
+  // not predict; it measures. At a candidate commit the same horizon is routed twice from the
+  // same board state -- once with the candidate declined, once with it committed -- and the
+  // candidate is kept only if its horizon ends with no more incomplete connections.
+  //
+  // Trial ORDER is load-bearing: the decline probe runs BEFORE the commit and the accept probe
+  // runs INSIDE the commit's own snapshot, so a kept commit is never rolled back and re-applied
+  // (re-committing a plan onto a board restored by undo would hand InsertFoundConnectionAlgo
+  // start/target Item references that undo may have replaced with their restored copies).
+  // ---------------------------------------------------------------------------------------
+
+  /** 0 = the whole horizon list; otherwise the probe stops after K (item, net) attempts. */
+  private static final int LOOKAHEAD_K =
+      Integer.getInteger("fr.lookahead.k", 0);
+  /**
+   * How many passes each probe routes; 1 = finish the current pass only. Defaults to the
+   * router's own pass budget, i.e. the probe simulates the whole REMAINING RUN, because
+   * shorter horizons were measured to pick badly: on bm01 a one-pass horizon is a precise
+   * measurement of the wrong thing (958.95/8, worse than not looking ahead at all), while the
+   * full-run horizon holds the champion (994.85/1).
+   */
+  private static final int LOOKAHEAD_PASSES =
+      Integer.getInteger("fr.lookahead.passes", 8);
+  /**
+   * What to do when both trials end with the same incomplete count: "accept" (default) leaves
+   * the underlying configuration's behaviour alone wherever the horizon sees no difference,
+   * "decline" suppresses every commit the horizon cannot show a gain for.
+   */
+  private static final String LOOKAHEAD_TIE =
+      System.getProperty("fr.lookahead.tie", "accept");
+  /**
+   * How many incomplete connections the accept horizon may be WORSE by and still be kept.
+   *
+   * <p>0 is the untuned rule -- keep only what the horizon does not show losing -- and it is
+   * measurably too strict, because each candidate is probed against a continuation in which NO
+   * later candidate commits, so a set of commits that only pays TOGETHER is killed at its first
+   * member. bm04 shows this exactly: probed alone the three candidates score 5, 5 and 2 against
+   * a decline-all continuation of 3, so a zero margin declines two of them and the board falls
+   * to 972.02/4 -- below flag-off -- while keeping all three gives 986.01/2, and with the
+   * margin the SECOND probe (measured from the board that already carries the first commit)
+   * flips to accept=3 vs decline=5.
+   *
+   * <p><b>2 is a constant fitted to four boards</b> (it is the largest single-commit loss the
+   * measured complementary chains show) and its generalization is unmeasured. It is the value
+   * at which all four gate boards meet their targets; at 0, three of four do.
+   */
+  private static final int LOOKAHEAD_MARGIN =
+      Integer.getInteger("fr.lookahead.margin", 2);
+  /** Measurement only: how many times each decline probe is repeated from the same board. */
+  private static final int LOOKAHEAD_REPEAT =
+      Integer.getInteger("fr.lookahead.repeat", 1);
+  /**
+   * The pull-tight budget (ms, 0 = unlimited) used INSIDE a probe. The router's own budget is
+   * a 1000 ms WALL-CLOCK limit, and the campaign already traced run-to-run geometry variance
+   * to it; inside a probe that variance becomes measurement noise, so this exists to test
+   * whether removing the deadline makes the horizon reproducible.
+   */
+  private static final int LOOKAHEAD_PULLTIGHT =
+      Integer.getInteger("fr.lookahead.pulltight", TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+
+  /**
+   * The pull-tight deadline for the code running right now: the router's own constant, or the
+   * probe's budget while a lookahead probe is routing. Identical to the constant whenever the
+   * lookahead flag is off.
+   */
+  private int pull_tight_limit() {
+    return this.in_lookahead ? LOOKAHEAD_PULLTIGHT : TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP;
+  }
+
+  private boolean isCommitLookaheadEnabled() {
+    return app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.commitLookahead;
+  }
+
+  /** True while a lookahead probe is routing, which disables nested partition attempts. */
+  private boolean in_lookahead;
+  /**
+   * Set once a routing pass is under way, which is the precondition for probing: a probe
+   * simulates the continuation of a pass, so there has to be one.
+   */
+  private boolean lookahead_pass_active;
+  /** The pass number the probes route as. */
+  private int lookahead_pass_no = 1;
+  private long lookahead_probe_count;
+  private long lookahead_accept_count;
+  private long lookahead_decline_count;
+  private long lookahead_tie_count;
+  private long lookahead_ms;
+
+  /**
+   * Routes one bounded horizon from a THROWAWAY CLONE of the board and returns the number of
+   * incomplete connections the horizon ended with (lower is better). The live board is not
+   * touched at all.
+   *
+   * <p>The clone, not a snapshot/undo bracket, is the load-bearing choice, and it was forced by
+   * measurement. An undo-based probe restores every last piece of copper -- the copper digest
+   * proves it -- and STILL leaves the next probe of the identical board measuring something
+   * else: repeating one probe three times gave 47/54/49, 52/48/50, 61/50/48. Rewinding the item
+   * id counter changed nothing, and removing the wall-clock pull-tight deadline changed nothing,
+   * so the residue is the board's own rebuilt-in-a-different-order internal structure (the
+   * search trees are rebuilt item by item as undo restores them). {@code BasicBoard.readObject}
+   * rebuilds the search trees from the canonical item order instead, so two clones of the same
+   * bytes are the same board in every respect a search can observe.
+   *
+   * <p>The metric is CONNECTIVITY, not geometry: the campaign traced run-to-run geometry
+   * variance to the 1000 ms wall-clock pull-tight limit, and an incomplete count cannot see
+   * where pull-tight stopped.
+   *
+   * <p>Nested partition/negotiation commits are disabled inside the probe ({@link
+   * #in_lookahead}), so the horizon is routed by the classic engine only: a probe cannot
+   * recurse, and its cost stays bounded by the pass it simulates. That is also the mechanism's
+   * main fidelity gap -- the real continuation keeps making partition commits, the probed one
+   * does not.
+   */
+  private int lookahead_probe() {
+    long t0 = System.currentTimeMillis();
+    ++lookahead_probe_count;
+    RoutingBoard live_board = this.board;
+    boolean saved_in_lookahead = this.in_lookahead;
+    RoutingBoard probe_board = (RoutingBoard) BasicBoard.deserialize(live_board.serialize(false));
+    if (probe_board == null) {
+      FRLogger.error("Lookahead probe could not clone the board; treating the horizon as unmeasured", null);
+      return Integer.MAX_VALUE;
+    }
+    this.board = probe_board;
+    this.in_lookahead = true;
+    try {
+      int attempts = 0;
+      // The router is scored on the BEST board it reaches, not the last one (the end-of-run
+      // best-board restore), so a multi-pass horizon is scored the same way.
+      int best = Integer.MAX_VALUE;
+      for (int horizon_pass = 0; horizon_pass < Math.max(1, LOOKAHEAD_PASSES); horizon_pass++) {
+        // Rebuilt from the clone every pass: the live board's Item objects do not exist on it.
+        // This is also why the horizon is "every connection still incomplete" rather than "the
+        // rest of the pass list from the cursor" -- on the clone the two coincide for the
+        // negotiation commit phase, which runs before the pass routes anything.
+        List<Item> horizon = getAutorouteItems(this.board, new ArrayList<>());
+        if (horizon.isEmpty()) {
+          break;
+        }
+        for (Item curr_item : horizon) {
+          for (int net_index = 0; net_index < curr_item.net_count(); net_index++) {
+            if (this.thread.is_stop_auto_router_requested()
+                || (LOOKAHEAD_K > 0 && attempts >= LOOKAHEAD_K)) {
+              return Math.min(best, calculateIncompleteCount(this.board));
+            }
+            ++attempts;
+            this.board.start_marking_changed_area();
+            autoroute_item(curr_item, curr_item.get_net_no(net_index), new TreeSet<>(),
+                new LinkedHashMap<>(), this.lookahead_pass_no + horizon_pass);
+          }
+        }
+        remove_tails(this.remove_unconnected_vias
+            ? Item.StopConnectionOption.NONE : Item.StopConnectionOption.FANOUT_VIA);
+        best = Math.min(best, calculateIncompleteCount(this.board));
+      }
+      return best;
+    } catch (Exception e) {
+      FRLogger.error("Lookahead probe failed; treating the horizon as unmeasured", e);
+      return Integer.MAX_VALUE;
+    } finally {
+      this.board = live_board;
+      this.in_lookahead = saved_in_lookahead;
+      lookahead_ms += System.currentTimeMillis() - t0;
+    }
+  }
+
+  /**
+   * The lookahead counters, or the empty string when the flag is off (so flag-off log output
+   * stays byte-identical).
+   */
+  private String lookahead_report() {
+    if (!isCommitLookaheadEnabled()) {
+      return "";
+    }
+    return " lookahead_probes=" + lookahead_probe_count
+        + " lookahead_accepts=" + lookahead_accept_count
+        + " lookahead_declines=" + lookahead_decline_count
+        + " lookahead_ties=" + lookahead_tie_count
+        + " lookahead_ms=" + lookahead_ms;
+  }
+
+  /**
+   * The lookahead's decision rule: keep a candidate whose accept horizon ends with at most
+   * {@code p_decline_incompletes + p_margin} incomplete connections.
+   *
+   * <p>Exactly on the threshold the candidate is kept unless {@code p_tie} is "decline", which
+   * is what leaves the underlying configuration's behaviour alone wherever the horizon sees no
+   * difference at all. Both horizons are incomplete COUNTS, so lower is better and the rule is
+   * a plain comparison -- there is no scoring function to tune, only the margin.
+   */
+  static boolean lookahead_keeps(int p_accept_incompletes, int p_decline_incompletes,
+      int p_margin, String p_tie) {
+    // A probe that failed reports Integer.MAX_VALUE. An unmeasured horizon is not evidence,
+    // so the candidate goes to the classic engine rather than being kept on a guess -- and the
+    // threshold is computed in long so the sentinel cannot wrap negative and read as an accept.
+    if (p_accept_incompletes == Integer.MAX_VALUE || p_decline_incompletes == Integer.MAX_VALUE) {
+      return false;
+    }
+    long threshold = (long) p_decline_incompletes + p_margin;
+    if (p_accept_incompletes == threshold) {
+      return !"decline".equals(p_tie);
+    }
+    return p_accept_incompletes < threshold;
+  }
+
+  /**
+   * A canonical digest of the board's COPPER -- every trace and via as (net, layer, corners),
+   * sorted, so the digest is independent of container iteration order.
+   *
+   * <p>Deliberately not {@code BasicBoard.get_hash()}: that serializes {@code item_list}
+   * itself, so it also digests the undo stack and therefore always differs after a probe even
+   * when the probe restored every last piece of copper. This is the predicate the probe's
+   * rollback actually has to satisfy.
+   */
+  private String copper_digest() {
+    List<String> lines = new ArrayList<>();
+    for (Trace trace : board.get_traces()) {
+      StringBuilder line = new StringBuilder("T");
+      for (int i = 0; i < trace.net_count(); i++) {
+        line.append(':').append(trace.get_net_no(i));
+      }
+      line.append('@').append(trace.get_layer());
+      if (trace instanceof PolylineTrace polyline_trace) {
+        for (int i = 0; i < polyline_trace.corner_count(); i++) {
+          line.append('|').append(polyline_trace.polyline().corner_approx(i));
+        }
+      }
+      lines.add(line.toString());
+    }
+    for (Via via : board.get_vias()) {
+      StringBuilder line = new StringBuilder("V");
+      for (int i = 0; i < via.net_count(); i++) {
+        line.append(':').append(via.get_net_no(i));
+      }
+      line.append('@').append(via.get_center());
+      lines.add(line.toString());
+    }
+    java.util.Collections.sort(lines);
+    return lines.size() + "/" + Integer.toHexString(String.join(";", lines).hashCode());
+  }
+
+
   /**
    * The negotiation round's dry-route room usage, published for the duration of the commit
    * phase so {@link #commit_features} can price corridor contention; null everywhere else
@@ -1361,6 +1679,12 @@ public class BatchAutorouter extends NamedAlgorithm {
       if (autoroute_item_list.isEmpty()) {
         this.air_line = null;
         return false;
+      }
+
+      // The trial-commit lookahead probes the continuation of THIS pass.
+      if (isCommitLookaheadEnabled()) {
+        this.lookahead_pass_active = true;
+        this.lookahead_pass_no = p_pass_no;
       }
 
       if (isNegotiatedRouterEnabled() && p_pass_no == 1) {
@@ -1634,7 +1958,8 @@ public class BatchAutorouter extends NamedAlgorithm {
         job.logInfo("[partition-router] pass=" + p_pass_no + " routed=" + partition_routed_count
             + " fallback=" + partition_fallback_count
             + " drc_reject=" + partition_drc_reject_count
-            + live_channel_report());
+            + live_channel_report()
+            + lookahead_report());
         partition_routed_count = 0;
         partition_fallback_count = 0;
         partition_drc_reject_count = 0;
@@ -2578,7 +2903,7 @@ public class BatchAutorouter extends NamedAlgorithm {
     board.start_marking_changed_area();
     board.remove_trace_tails(-1, p_stop_connection_option);
     board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, this.trace_cost_arr, this.thread,
-        TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+        pull_tight_limit());
   }
 
   // Tries to route an item on a specific net. Returns true, if the item is
@@ -2653,7 +2978,11 @@ public class BatchAutorouter extends NamedAlgorithm {
       double airline_distance = (this.air_line != null && this.air_line.a != null
           && this.air_line.b != null) ? this.air_line.a.distance(this.air_line.b) : -1;
       boolean long_connection = airline_distance >= 150000;
-      if (isPartitionRouterEnabled() && !contains_plane && p_ripup_pass_no <= 1 && long_connection) {
+      // Inside a lookahead probe the horizon is routed by the classic engine only: a probe
+      // that could itself commit partition routes would recurse into further probes, and its
+      // cost would stop being bounded by the pass it simulates.
+      if (isPartitionRouterEnabled() && !this.in_lookahead && !contains_plane
+          && p_ripup_pass_no <= 1 && long_connection) {
         AutorouteAttemptResult partition_result = try_partition_route(route_start_set, route_dest_set,
             autoroute_control, airline_distance);
         if (partition_result != null) {
@@ -2678,7 +3007,7 @@ public class BatchAutorouter extends NamedAlgorithm {
         int maxItemIdBeforeOpt = board.communication.id_no_generator.max_generated_no();
         FRLogger.trace("compare_trace_opt_changed_area_before net=" + p_route_net_no + ", maxItemId=" + maxItemIdBeforeOpt);
         board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, autoroute_control.trace_costs,
-            this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+            this.thread, pull_tight_limit());
         int maxItemIdAfterOpt = board.communication.id_no_generator.max_generated_no();
         FRLogger.trace("compare_trace_opt_changed_area_after net=" + p_route_net_no + ", maxItemId=" + maxItemIdAfterOpt + ", delta=" + (maxItemIdAfterOpt - maxItemIdBeforeOpt));
       }
@@ -2799,7 +3128,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       return null;
     }
     board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, neck_control.trace_costs,
-        this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+        this.thread, pull_tight_limit());
     Net route_net = board.rules.nets.get(p_route_net_no);
     FRLogger.info("Necked retry routed net '"
         + (route_net != null ? route_net.name : "#" + p_route_net_no)

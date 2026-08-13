@@ -160,6 +160,28 @@ public class FeatureFlagsSettings implements Serializable {
    * plans. Default off, and not recommended for default on.
    */
   public boolean commitPolicy = false;
+  /**
+   * Trial-commit lookahead for partition-originated commits (docs/dense-bga-roadmap.md, the
+   * follow-up the commit-acceptance refutation shaped): instead of predicting a commit's value
+   * from commit-local features -- which no measured predicate can do -- the router MEASURES it.
+   * At a candidate commit the board is probed twice from the same state: once with the
+   * candidate declined (the classic engine routes the horizon) and once with it committed, each
+   * probe rolled back through the snapshot/undo bracket the commit policy already uses. The
+   * candidate is kept only if its horizon leaves no more incomplete connections than declining
+   * it does.
+   *
+   * <p>The horizon is the remainder of the current pass by default ({@code -Dfr.lookahead.k}
+   * bounds it to K connections, {@code -Dfr.lookahead.passes} extends it over more passes), and
+   * the compared outcome is the board's incomplete-connection count -- a connectivity measure,
+   * so it is immune to the pull-tight geometry jitter that makes mid-pass board hashes
+   * wall-clock dependent. Ties accept by default ({@code -Dfr.lookahead.tie=decline} inverts
+   * it), so a horizon that sees no difference leaves the underlying configuration's behaviour
+   * alone.
+   *
+   * <p>Composes with {@link #liveChannelValidation}; only affects partition/negotiation plans.
+   * Default off.
+   */
+  public boolean commitLookahead = false;
   @SerializedName("inspection_mode")
   public boolean inspectionMode;
   @SerializedName("other_menu")
