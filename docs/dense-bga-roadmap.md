@@ -482,6 +482,9 @@ member's actual pads, (b) a two-polyline offset emission with both sides validat
 session. The windowed-channel substrate and the diff-pair detection (MeanderMatcher.
 detect_pairs) are in place as the starting points.
 
+*(Built 2026-08-12 -- see "Phase 5 item 6: paired routing with dual offset emission" at the end
+of this document for what shipped and what it measures.)*
+
 ## Materialization DRC: diagnosed, repair REFUTED both fixtures (2026-08-09)
 
 The reject diagnostics (`BasicBoard.explain_polyline_trace_reject`, a read-only twin of
@@ -1300,3 +1303,176 @@ live_shrinks=41). `CommitPolicyTest` pins the predicate against the measured fea
 (it fails if the shipped predicate stops declining bm05's diagnosed toxic commit or starts
 declining bm04's three paying ones, and it encodes the two refutations as assertions); full
 non-slow unit suite green.
+
+## Phase 5 item 6: paired routing with dual offset emission (2026-08-12)
+
+`featureFlags.pairedRouting` (`-Dfr.pairedroute`, default off), production class
+`autoroute/PairedRouter`, invoked once after fanout and before the first routing pass so both
+members of a pair are still unrouted and the pair gets first claim on its corridor. The
+roadmap's own three-part scope for this item is what shipped:
+
+**(a) Pair-aware connection selection and terminal fan-in.** Each member of a
+name-convention pair (`MeanderMatcher.detect_pairs`, the meander matcher's detection) is
+decomposed into its connected components; the pair is in scope when both members have exactly
+two (one unrouted connection each). The members' components are matched end-to-end by centroid
+distance, and the UNION of the two matched components becomes the start/target set of ONE
+centreline search. A layer is eligible only when all four components have a terminal on it --
+excluded before the search, not discovered after realization. After the centreline is realized,
+each member attaches to its own terminal (the drill item of its component nearest the centreline
+end: the fanout via where there is one, the pad otherwise) through a 45-degree-legal fan-in leg,
+one axis-parallel segment plus one exact diagonal.
+
+**(b) Two-polyline offset emission with both sides validated.** The centreline is searched and
+materialized at the PAIR half width, so the partition's `min_pass` room admission, the windowed
+channels, the door windows and -- under `featureFlags.liveChannelValidation` -- the compensation
+erosion are all computed for a corridor that has to carry both traces. The realized centreline
+is then mitre-offset by +/- pitch/2 into two polylines (every offset segment stays at exactly
+the offset distance from its own centreline segment, so the members' lengths can differ only by
+their mitres and their fan-in legs) and each is validated with the board's own
+`check_polyline_trace`. The second member is validated with the first ALREADY ON THE BOARD, so
+the pair's own gap is checked against real copper by the real DRC rather than assumed from the
+pitch arithmetic.
+
+**(c) Commit coordination.** The pair sits inside one `generate_snapshot` / `undo` bracket
+(the commit-policy rollback path): if either member fails validation or insertion the board is
+rolled back whole and the classic engine routes both members as usual. A half-committed pair
+cannot survive.
+
+**Pair gap comes from the rules, and the 8-layer fixture proves it.** The pitch is
+`half_width+ + clearance_matrix(class+, class-) + half_width- + cushion`; the documented default
+(one trace width) applies only when the matrix carries nothing. Issue732's `USB_DIFF` class
+carries `(width 125) (clearance 203.2)`, and the emitted pitch is exactly
+`625 + 2048 + 625 + 16 = 3314` board units -- the class's own rule, not a constant.
+
+**The cushion is measured, and it is tiny.** At the bare rule pitch (which already carries the
+clearance matrix's 16-unit safety margin) the two members sit exactly at the DRC minimum, and
+the INTEGER ROUNDING of the mitred offset corners loses the last unit. Sweep on the
+demonstration fixture: cushion 0 and 1 REJECT (the pair rolls back), 4 and up commit, and the
+pair's mismatch degrades monotonically with the cushion -- 910 at 4, 915 at 8, 925 at 16, 944 at
+32, 1141 at 200, 1843 at 800, 2663 at one half width. The rounded error is one unit per emitted
+coordinate and does not scale with board units, so the default is the fixed constant 16 (the
+board's own clearance safety margin): four times the measured threshold, 15 units of mismatch
+above the best achievable.
+
+**One correction the measurement forced on the pair-width erosion.** The compensated pair half
+width also has to carry the OUTER clearance. With the standard uncompensated default tree a
+member's own `compensated_trace_half_width` equals its pen half width, so a channel eroded by
+`pitch/2 + compensated_half_width` puts the outer member's CENTRE against the obstacle: measured
+on the demonstration fixture as a reject 14 units short of the wall clearance, twice, at two
+different pitches. The single-net path can leave that to the pre-insert DRC (it just loses a
+plan); a pair plan is expensive to lose, so the pair corridor adds
+`clearance_matrix.max_value(class, layer)`. With that in, the eroded-corridor machinery
+generalizes to a pair-width erosion exactly as the scope hoped -- and on the demonstration
+fixture `-Dfr.livechannel` then makes no difference at all (identical commit, identical
+lengths), because the wider `min_pass` alone already keeps the corridor off the walls.
+
+### The demonstration: `fixtures/PairRouteGaps.dsn`
+
+No gate fixture exhibits a pairable pair (see below), so the mechanism is demonstrated on a
+purpose-built fixture in the `RuleRegionGap.dsn` tradition: 2 layers, 4 x 2.2 mm, one
+differential pair (D+/D-, through-hole pads so no fanout intervenes, 0.06 mm apart) and a
+vertical wall with two gaps. The upper gap (0.08 mm clear) fits exactly ONE trace and not a
+pair; the lower gap (0.25 mm clear) fits the pair. Routing the members independently and
+greedily therefore sends one through the near gap and the other on a long detour through the far
+one.
+
+| run | score / unrouted / violations | D+ | D- | mismatch |
+|---|---|---|---|---|
+| flag-off (classic engine) | **999.99 / 0 / 0** | 304971 | 360132 | **55162** |
+| `-Dfr.pairedroute` | **999.98 / 0 / 0** | 368214 | 369139 | **925** |
+| `-Dfr.pairedroute -Dfr.livechannel` | 999.98 / 0 / 0 | 368214 | 369139 | 925 |
+
+**The mechanism's success bar is met**: both members emitted from one centreline, both validated
+by the board's own DRC (the second against the first's real copper), one atomic commit, **zero
+added violations**, and the pair's routed-length mismatch **55162 -> 925, a factor of 60**. The
+score cost is the honest trade: 0.01 of score for ~70000 units of extra trace, because both
+members now take the corridor the pair needs instead of one taking the short gap.
+
+**Atomicity, measured rather than asserted.** Forcing the cushion to 1
+(`-Dfr.pairedroute.cushion=1`) makes the SECOND member fail the DRC after the first is already
+inserted. The run reports `pair_rollbacks=1` and lands on **exactly the flag-off board**:
+999.99 / 0 / 0, D+ 304971, D- 360132, mismatch 55162, identical to the classic-engine run in
+every measured quantity. `PairedRoutingTest` pins both halves (the collapse and the rollback),
+and `PairedRouterGeometryTest` pins the offset geometry (constant offset distance through 45-
+and 90-degree corners, direction preservation, refusal on a doubling-back centreline) and the
+fan-in leg's 45-degree legality.
+
+**Determinism**: flag-on is 2/2 identical to the final BOARD HASH (`1c9ca5d1...`), identical
+counters (`attempted=1 committed=1 search_failures=0 validation_rejects=0 pair_rollbacks=0`) and
+identical per-member lengths.
+
+### What pairing does to real boards
+
+**bm01 (2-layer): the stage declines, for a stated reason, at exact parity.** D+/D- is detected
+and attempted; the pair's terminals are SMD pads that the fanout stage never escaped, so the
+only eligible layer is the top one, and no top-layer corridor on that board is
+`2*half_width + pair_gap + clearances` wide. Result: `attempted=1 committed=0
+search_failures=1`, final **989.72 / 2 / 0 with the identical unrouted set {ADC12, TXD1} and the
+identical board hash as flag-off**, pair mismatch unchanged at 43478. The paired stage is inert
+on bm01 rather than harmful -- the campaign's preferred failure mode.
+
+**Issue732 microvia (8-layer, escape+reflow, 20 min): the pair is REACHED and REFUSED, twice,
+for two different named reasons -- and the standing win is held exactly in both.** This is the
+first fixture where the pair machinery gets all the way to emission on a real board: the pair
+gap comes from the `USB_DIFF` class (pitch 3314), the corridor search succeeds on layer 1, and
+the centreline realizes with 13-14 corners.
+
+- **Without live channel validation**: D+ is emitted and passes the DRC, D- fails it on a
+  FOREIGN trace (`PolylineTrace#9874`, net 37) at its second shape, and the pair is rolled back
+  (`pair_rollbacks=1`). The rollback is the expected class-2 signature -- the plan's channels were
+  only ever validated against the partition's point model, which does not know the corridor has to
+  carry two trace bodies.
+- **With live channel validation**: the plan is validated at pair width and realizes a DIFFERENT
+  centreline, and emission is then refused before any insertion for a geometric reason the
+  diagnostic now names: `sides 0/0, per end +[0,0] -[1,-1]`. D+'s terminals lie exactly ON the
+  centreline at both ends (the partition attached it to D+'s vias), and **D- is on one side of
+  the centreline at the start terminal and on the OTHER side at the target terminal**. A
+  constant-offset emission of a pair that swaps sides would make the members cross. That needs a
+  crossover structure, which v1 does not build, so the pair is refused rather than emitted
+  crossing.
+
+Both configurations finish at **465.13 / 55 unrouted / 538 violations** -- exactly the standing
+escape+needs-filter win -- with the identical 55-net unrouted set and the pair's mismatch
+unchanged at 39641. Notably the no-LC run holds that score even though its rolled-back insert
+consumes two item ids permanently (`undo` restores items, not the id counter), so the
+id-renumbering perturbation did not move this board's trajectory.
+
+### Verdict: the flag stays default off
+
+The MECHANISM bar is met, in full, on the demonstration fixture: both members emitted from one
+centreline, both validated by the board's own DRC (the second against the first's real copper),
+one atomic commit, deterministic to the board hash, zero added violations, and the mismatch down
+by a factor of 60. The DEFAULTING bar is a different question and the answer is no, for a reason
+that is about REACH rather than about damage: on the two real fixtures the stage never commits.
+bm01 declines because the pair's SMD terminals were never escaped and the top layer has no
+pair-wide corridor; Issue732 declines because the pair's terminals require a crossover. Both
+decline at exact gate parity and zero added violations -- the stage is inert where it cannot
+work, which is the behaviour the campaign wants from a default-off mechanism, but "inert on
+every gate board" is not a case for turning it on.
+
+**What would change that**, in the order the measurements point:
+
+1. **A crossover** (the members swap sides at a defined point, each half emitted as its own
+   constant-offset run). Issue732's refusal is exactly this and nothing else.
+2. **Pair-aware escape**, so a pair whose terminals are unescaped SMD pads gets its two vias
+   placed as a pair on a layer with room. bm01's refusal is exactly this: the pair is confined
+   to the top layer because the fanout never reached those two pins.
+3. **Multi-terminal pairs.** v1 requires exactly one unrouted connection per member; anything
+   else is skipped with a counted reason.
+
+Note also what this increment does NOT claim: no congestion effect was measured, because the
+stage never committed on a congested board. The prediction that a paired commit is a bigger
+corridor claim than a single one -- and therefore more likely to be endgame-toxic -- remains
+untested, and is the first thing to measure once (1) or (2) makes a pair commit on a gate board.
+
+**Verification.** Flag-off gates EXACT on the final code: bm01 **989.72/2/0** (unrouted
+{ADC12, TXD1}); bm01 negotiation champion **994.85/1/0** with the champion counters
+(committed=3, attempt_drc_rejects=13); bm05 2-min **831.77/18/0**; bm04 10-min **979.01/3/0**
+(unrouted {/PB7, /PB6, /MOSI}). Flag-on: demonstration fixture **999.98/0/0 with mismatch
+55162 -> 925, 2/2 identical to the final board hash `1c9ca5d1...` and identical counters**;
+bm01 `-Dfr.pairedroute` **989.72/2/0 with the SAME BOARD HASH as flag-off** (the stage inserts
+nothing, so the run is byte-identical); Issue732 microvia escape+reflow+paired, and the same
+plus live channel validation, both **465.13/55/538**. `PairedRoutingTest` (mismatch collapse,
+determinism, and the forced-rollback atomicity proof) and `PairedRouterGeometryTest` (constant
+offset distance through 45- and 90-degree corners, direction preservation, hairpin refusal,
+45-degree fan-in legality) are new; full non-slow unit suite green.

@@ -107,7 +107,8 @@ public final class MeanderMatcher {
     return report;
   }
 
-  private static double net_length(RoutingBoard p_board, String p_net_name) {
+  /** Total routed trace length of a net by name; shared with {@link PairedRouter}. */
+  static double net_length(RoutingBoard p_board, String p_net_name) {
     double result = 0;
     for (var net : p_board.rules.nets.get(p_net_name)) {
       for (Item item : p_board.get_items()) {

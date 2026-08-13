@@ -2164,6 +2164,25 @@ public class BatchAutorouter extends NamedAlgorithm {
       }
     }
 
+    // Phase-5 paired routing: runs once, after fanout and before the first routing pass, so both
+    // members of a differential pair are still unrouted and the pair gets first claim on its
+    // corridor. Every commit is atomic across the pair (see PairedRouter).
+    if (app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.pairedRouting) {
+      try {
+        PairedRouter paired = new PairedRouter(this.board, this.settings, this.trace_cost_arr);
+        for (String line : paired.route_pairs()) {
+          job.logInfo("[paired-route] " + line);
+        }
+        long[] counters = paired.counters();
+        job.logInfo("[paired-route] attempted=" + counters[0] + " committed=" + counters[1]
+            + " search_failures=" + counters[2] + " validation_rejects=" + counters[3]
+            + " pair_rollbacks=" + counters[4] + " skipped=" + counters[5]);
+      } catch (Exception e) {
+        job.logError("Paired routing failed", e);
+      }
+    }
+
     int currentUnrouted = calculateIncompleteCount(this.board);
     boolean isRouterEnabled = this.settings.getRunRouter() && (this.settings.maxPasses == null || this.settings.maxPasses >= 0);
     if (isRouterEnabled) {
@@ -2457,6 +2476,25 @@ public class BatchAutorouter extends NamedAlgorithm {
         }
       } catch (Exception e) {
         job.logError("Meander matching failed", e);
+      }
+    }
+
+    // Final per-pair routed-length report -- the A/B metric for paired routing. Emitted with the
+    // paired flag on, and on demand (-Dfr.pairlength) so the unpaired baseline of the same
+    // fixture can be measured without turning any routing behaviour on.
+    if ((app.freerouting.Freerouting.globalSettings != null
+        && app.freerouting.Freerouting.globalSettings.featureFlags.pairedRouting)
+        || Boolean.getBoolean("fr.pairlength")) {
+      try {
+        for (var pair : MeanderMatcher.detect_pairs(this.board).entrySet()) {
+          double len_p = PairedRouter.net_length(this.board, pair.getKey());
+          double len_n = PairedRouter.net_length(this.board, pair.getValue());
+          job.logInfo("[pair-length] " + pair.getKey() + "/" + pair.getValue()
+              + ": len+=" + Math.round(len_p) + " len-=" + Math.round(len_n)
+              + " mismatch=" + Math.round(Math.abs(len_p - len_n)));
+        }
+      } catch (Exception e) {
+        job.logError("Pair length report failed", e);
       }
     }
 

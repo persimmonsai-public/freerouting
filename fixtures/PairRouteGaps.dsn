@@ -1,0 +1,90 @@
+(pcb "PairRouteGaps.dsn"
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "freerouting-test")
+    (host_version "1.0")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer Top
+      (type signal)
+      (property
+        (index 0)
+      )
+    )
+    (layer Bottom
+      (type signal)
+      (property
+        (index 1)
+      )
+    )
+    (boundary
+      (path pcb 0  0 0  40000 0  40000 -22000  0 -22000  0 0)
+    )
+    (via "Via[0-1]_600:300_um")
+    (rule
+      (width 300)
+      (clearance 200)
+    )
+  )
+  (library
+    (padstack Rect[TB]Pad_200x200_um
+      (shape (rect Top -100 -100 100 100))
+      (shape (rect Bottom -100 -100 100 100))
+      (attach off)
+    )
+    (padstack "Via[0-1]_600:300_um"
+      (shape (circle Top 600))
+      (shape (circle Bottom 600))
+      (attach off)
+    )
+    (image "TPAD"
+      (pin Rect[TB]Pad_200x200_um 1 0 0)
+    )
+  )
+  (placement
+    (component "TPAD"
+      (place P1 5000 -9000 front 0.000000)
+      (place P2 5000 -9600 front 0.000000)
+      (place P3 35000 -9000 front 0.000000)
+      (place P4 35000 -9600 front 0.000000)
+    )
+  )
+  (network
+    (net D+
+      (pins P1-1 P3-1)
+    )
+    (net "D-"
+      (pins P2-1 P4-1)
+    )
+    (net WALLT1
+      (pins)
+    )
+    (net WALLT2
+      (pins)
+    )
+    (net WALLT3
+      (pins)
+    )
+    (net WALLB1
+      (pins)
+    )
+    (class default
+      (circuit
+        (use_via "Via[0-1]_600:300_um")
+      )
+      (rule
+        (width 300)
+        (clearance 200)
+      )
+    )
+  )
+  (wiring
+    (wire (path Top 1000  20000 -1000  20000 -7500)(net WALLT1)(type protect))
+    (wire (path Top 1000  20000 -9300  20000 -16000)(net WALLT2)(type protect))
+    (wire (path Top 1000  20000 -19500  20000 -21000)(net WALLT3)(type protect))
+    (wire (path Bottom 1000  20000 -1000  20000 -21000)(net WALLB1)(type protect))
+  )
+)

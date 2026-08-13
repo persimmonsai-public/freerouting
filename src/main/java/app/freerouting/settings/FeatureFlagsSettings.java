@@ -95,6 +95,19 @@ public class FeatureFlagsSettings implements Serializable {
    */
   public boolean pairCorridorAffinity = false;
   /**
+   * Paired differential routing with dual offset emission (docs/dense-bga-roadmap.md Phase 5
+   * item 6): before the first routing pass, each name-convention differential pair whose two
+   * members each have exactly one unrouted connection is routed as ONE centreline through the
+   * partition's windowed channels at the PAIR half width, then emitted as two mitre-offset
+   * polylines (pitch from the members' clearance-matrix entry) with a 45-degree fan-in to each
+   * member's own terminals. Both members are validated with the board's own DRC -- the second
+   * with the first already inserted, so the pair gap is checked against real copper -- and the
+   * whole pair sits in one snapshot/undo bracket, so a half-committed pair cannot survive.
+   * Committed members are SHOVE_FIXED (pull-tight would straighten the two independently).
+   * Default off.
+   */
+  public boolean pairedRouting = false;
+  /**
    * Region-scoped rule overrides (docs/dense-bga-roadmap.md Phase 1 item 1): axis-aligned
    * boxes with a layer set, a clearance override and optionally a trace half-width override,
    * configured via {@code router.rule_regions}. When enabled: (1) the DRC insertability check

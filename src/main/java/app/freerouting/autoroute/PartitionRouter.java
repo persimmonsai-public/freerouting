@@ -73,6 +73,26 @@ public final class PartitionRouter {
     this.room_prices = p_prices;
   }
 
+  /**
+   * The nets whose copper counts as OWN copper for the channel validation of this router's
+   * plans. Null (the default, and the only value any single-net caller sets) means "the
+   * control's net", which is what every flag-off and single-net path uses.
+   *
+   * <p>{@link PairedRouter} sets both members of a differential pair: a pair corridor runs along
+   * both members' pads, so validating it against a single net would reject every terminal
+   * channel on the partner's own pads.
+   */
+  public void set_pair_nets(int[] p_nets) {
+    this.pair_nets = p_nets;
+  }
+
+  private int[] pair_nets;
+
+  /** The own-net array the live channel validation queries with. */
+  private int[] own_nets(AutorouteControl p_ctrl) {
+    return pair_nets != null ? pair_nets : new int[]{p_ctrl.net_no};
+  }
+
   public static String box_key(IntBox p_box) {
     return p_box.ll.x + ":" + p_box.ll.y + ":" + p_box.ur.x + ":" + p_box.ur.y;
   }
@@ -200,6 +220,17 @@ public final class PartitionRouter {
    */
   public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width,
       boolean p_lift, Set<String> p_partner_room_keys) {
+    return try_route(p_start_set, p_dest_set, p_half_width, p_lift, p_partner_room_keys, null);
+  }
+
+  /**
+   * As above; p_allowed_layers (nullable, and null for every single-net caller) restricts the
+   * search to the layers whose entry is true. {@link PairedRouter} uses it to exclude layers on
+   * which one member of the pair has no terminal, because a single-layer pair emission cannot
+   * attach there.
+   */
+  public CellRoute try_route(Set<Item> p_start_set, Set<Item> p_dest_set, int[] p_half_width,
+      boolean p_lift, Set<String> p_partner_room_keys, boolean[] p_allowed_layers) {
     ensure_fresh();
     // The routing net's own items must not be walls: Locate seeds the destination from the
     // item's CONNECTION shape -- the pad center point for drill items, the centerline for
@@ -231,7 +262,8 @@ public final class PartitionRouter {
       CellRoute best = null;
       double best_cost = Double.MAX_VALUE;
       for (int layer = 0; layer < partitions.length; layer++) {
-        if (partitions[layer] == null) {
+        if (partitions[layer] == null
+            || (p_allowed_layers != null && !p_allowed_layers[layer])) {
           continue;
         }
         CellRoute route = try_route_on_layer(layer, p_start_set, p_dest_set,
@@ -724,7 +756,7 @@ public final class PartitionRouter {
   private IntBox live_free_channel(IntBox p_channel, IntBox p_entry, IntBox p_exit, int p_layer,
       AutorouteControl p_ctrl, int p_compensated_half_width) {
     int pen_half_width = p_ctrl.trace_half_width[p_layer];
-    int[] net_arr = new int[]{p_ctrl.net_no};
+    int[] net_arr = own_nets(p_ctrl);
     int erosion = p_compensated_half_width + AutorouteEngine.TRACE_WIDTH_TOLERANCE + 1;
     IntBox current = compensated_channel(p_channel, p_entry, p_exit, erosion);
     if (current.area() < p_channel.area()) {
@@ -757,7 +789,7 @@ public final class PartitionRouter {
     for (app.freerouting.datastructures.ShapeTree.TreeEntry entry
         : p_live_tree.overlapping_tree_entries_with_clearance(corridor, p_layer, p_net_arr,
             p_clearance_class)) {
-      if (!(entry.object instanceof Item item) || !item.is_trace_obstacle(p_net_arr[0])) {
+      if (!(entry.object instanceof Item item) || !is_foreign(item, p_net_arr)) {
         continue;
       }
       TileShape shape = item.get_tree_shape(p_live_tree, entry.shape_index_in_object);
@@ -781,6 +813,21 @@ public final class PartitionRouter {
         ++live_stale_channel_count;
       }
       return false;
+    }
+    return true;
+  }
+
+  /**
+   * Whether an item obstructs the corridor of EVERY net it has to carry. With the single-net
+   * default this is exactly {@code is_trace_obstacle(net)}; for a pair corridor the partner's
+   * own copper is not an obstacle, which is what lets a pair channel run along both members'
+   * pads.
+   */
+  private static boolean is_foreign(Item p_item, int[] p_net_arr) {
+    for (int net_no : p_net_arr) {
+      if (!p_item.is_trace_obstacle(net_no)) {
+        return false;
+      }
     }
     return true;
   }

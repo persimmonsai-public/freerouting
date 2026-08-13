@@ -44,6 +44,7 @@ class RoutingProfileTest {
     Freerouting.globalSettings.featureFlags.negotiatedRouterParallelDry = Boolean.getBoolean("fr.negpar");
     Freerouting.globalSettings.featureFlags.meanderMatching = Boolean.getBoolean("fr.meander");
     Freerouting.globalSettings.featureFlags.pairCorridorAffinity = Boolean.getBoolean("fr.pairaffinity");
+    Freerouting.globalSettings.featureFlags.pairedRouting = Boolean.getBoolean("fr.pairedroute");
     Freerouting.globalSettings.featureFlags.checkedRealizer = Boolean.getBoolean("fr.checked");
     Freerouting.globalSettings.featureFlags.liveChannelValidation = Boolean.getBoolean("fr.livechannel");
     Freerouting.globalSettings.featureFlags.commitPolicy = Boolean.getBoolean("fr.commitpolicy");
