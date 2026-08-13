@@ -1711,8 +1711,8 @@ before the budget expires, and the harness's final recount is **108 incomplete**
 accounting over the run: **40 retries kept, 14 rolled back by the scope check**, spread over
 regions 1, 3, 4, 5 and 9. This answers the substantive question the 4-region run left open --
 with the trigger geometry correct and the memory bug gone, **the retry does fire and does
-succeed on a real board**, 40 times. The violation count is the open item: it is far above
-anything the small fixtures show and is not yet attributed (see below).
+succeed on a real board**, 40 times -- and the A/B below shows it leaves the board better than
+flag-off does, on both incompletes and violations.
 
 **Missing instrumentation, added.** v1 logged only retry SUCCESS and ROLLBACK, so "the trigger
 never fired" and "the retry ran and failed again" were the same silence -- and on this board it
@@ -1745,16 +1745,23 @@ class): **2/2 identical** -- 923.06/15/0 both runs, identical unrouted set, and 
 counter identical (`retry_candidates=74 no_region=0 attempted=74 route_failed=17
 scope_rollback=21 kept=36 regions=4`). Full non-slow unit suite green.
 
-**OPEN ITEM, not closed by this increment: the 1470 violations.** The region-enabled pass 1 on
-the repro board ends at 1470 clearance violations. That number is not explained by the region
-DRC rule -- the region clearance (762) is TIGHTER than this board's global clearance (900), so
-`min(global, region)` relaxes nothing here, and traces the retry inserts carry the region class
-whose matrix row requires 762 against everything, so the scored DRC agrees they are legal. The
-honest statement is that it is unattributed: the flag-off baseline for pass 1 on this fixture
-has not been measured to completion, so it is not yet known how much of the 1470 the regions
-own. **Do not read the region retry as violation-free on a real board until that A/B exists.**
-The memory fix is what this increment claims; the routing quality of region rules on a real
-dense board is the next thing to measure.
+**The 1470 violations are the BOARD, not the regions -- A/B measured.** 1470 clearance
+violations in pass 1 looks alarming until the baseline is run. Flag-off, same fixture, same
+`-Dfr.heap=4g`, same 40-minute budget, pass 1:
+
+| pass 1 on mcgyver-1gnd-frozen | score | unrouted | violations | duration |
+|---|---|---|---|---|
+| flag-off | 95.22 | 118 | 1595 | 1754.8 s |
+| 14 regions at `clearance_um` 76.2 | **161.47** | **111** | **1470** | 1804.2 s |
+
+The regions are **better on every axis** -- 7 fewer incompletes, 125 fewer violations, at a 3%
+pass-time cost. The violations are this partially-routed board's own pre-existing state being
+churned by pass 1, not something the retry introduces, which is what the mechanism predicted:
+the region clearance (762) is TIGHTER than this board's global clearance (900), so
+`min(global, region)` relaxes nothing here, and the traces the retry inserts carry the region
+class whose matrix row requires 762 against everything, so the scored DRC agrees they are
+legal. Neither number is a gate -- one pass of a 40-minute budget on a board that needs far
+more -- but the direction is measured and it is the right one.
 
 **Harness.** `-Dfr.heap=<size>` sets the forked test JVM's max heap and enables
 `-XX:+HeapDumpOnOutOfMemoryError`; `-Dfr.tasktimeout=<minutes>` raises the gradle test-task
