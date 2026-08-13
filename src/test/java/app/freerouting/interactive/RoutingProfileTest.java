@@ -60,7 +60,11 @@ class RoutingProfileTest {
   }
 
   @Test
-  @Timeout(value = 1500, unit = TimeUnit.SECONDS)
+  // Backstop only -- the run's real bound is the job budget (-Dfr.timeout) and the gradle task
+  // timeout (-Dfr.tasktimeout). Raised from 1500 s so that long measurement runs on large
+  // fixtures are bounded by their configured budget rather than by this annotation; every gate
+  // run uses a budget far below either bound, so their results are unaffected.
+  @Timeout(value = 5400, unit = TimeUnit.SECONDS)
   void profileSequentialRouting() {
     TestingSettings settings = new TestingSettings();
     settings.setMaxPasses(8);

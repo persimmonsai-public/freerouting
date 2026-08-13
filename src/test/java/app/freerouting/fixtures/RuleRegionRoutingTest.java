@@ -2,6 +2,7 @@ package app.freerouting.fixtures;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -81,6 +82,89 @@ public class RuleRegionRoutingTest extends RoutingFixtureTest {
         "in-region gap crossing must PASS the DRC check once the region is installed");
     assertFalse(board.check_polyline_trace(through_outside_gap, 0, PROBE_HALF_WIDTH, net_arr, clearance_class),
         "outside-region gap crossing must still FAIL: the region does not cover it");
+  }
+
+  /**
+   * Clearance-class sharing (the memory fix): the number of clearance classes appended by
+   * region installation is the number of DISTINCT clearance VALUES, not the number of
+   * regions. This is a memory-scaling invariant, not a cosmetic one -- the router allocates a
+   * separate FULL-BOARD compensated search tree per distinct clearance class it routes at and
+   * retains it for the life of the board (plus a precalculated tile-shape array per item per
+   * tree), so one class per region multiplies the whole board by the region count. Measured on
+   * an 8-layer fine-pitch board: 14 regions at one clearance OOM-ed a 6 GB heap in pass 1;
+   * sharing the class fits the same run in well under that (docs/dense-bga-roadmap.md).
+   */
+  @Test
+  void regionsShareOneClearanceClassPerDistinctClearanceValue() throws Exception {
+    RoutingBoard board = DsnTestFixtures.loadBoard(FIXTURE);
+    int classes_before = board.rules.clearance_matrix.get_class_count();
+
+    // 14 regions (the measured repro's count), all carrying the same clearance.
+    RuleRegionSettings[] same_clearance = new RuleRegionSettings[14];
+    for (int i = 0; i < same_clearance.length; i++) {
+      RuleRegionSettings curr = new RuleRegionSettings();
+      curr.layers = "*";
+      // Disjoint boxes, so this is not deduplication by geometry.
+      curr.boxUm = new double[] {500 + i * 1000, -7000, 1400 + i * 1000, -3000};
+      curr.clearanceUm = 80.0;
+      same_clearance[i] = curr;
+    }
+    RouterSettings settings = new RouterSettings();
+    settings.ruleRegions = same_clearance;
+    RuleRegion.install(board, settings);
+
+    assertNotNull(board.rule_regions);
+    assertEquals(14, board.rule_regions.size(), "all 14 regions must be installed");
+    assertEquals(classes_before + 1, board.rules.clearance_matrix.get_class_count(),
+        "14 regions at one clearance value must append exactly ONE clearance class");
+    int shared_class = board.rule_regions.get(0).clearance_class_no;
+    for (RuleRegion region : board.rule_regions) {
+      assertEquals(shared_class, region.clearance_class_no,
+          "every region at the same clearance must share the same clearance class");
+      assertEquals(800, region.clearance, "the shared class must still carry 80 um = 800 units");
+    }
+
+    // Distinct clearance values still get distinct classes: the class IS its clearance value,
+    // so regions at different clearances must not be collapsed.
+    RoutingBoard board2 = DsnTestFixtures.loadBoard(FIXTURE);
+    int classes_before2 = board2.rules.clearance_matrix.get_class_count();
+    double[] clearances = {80.0, 80.0, 120.0, 80.0, 120.0, 150.0};
+    RuleRegionSettings[] mixed = new RuleRegionSettings[clearances.length];
+    for (int i = 0; i < mixed.length; i++) {
+      RuleRegionSettings curr = new RuleRegionSettings();
+      curr.layers = "*";
+      curr.boxUm = new double[] {500 + i * 1000, -7000, 1400 + i * 1000, -3000};
+      curr.clearanceUm = clearances[i];
+      mixed[i] = curr;
+    }
+    RouterSettings settings2 = new RouterSettings();
+    settings2.ruleRegions = mixed;
+    RuleRegion.install(board2, settings2);
+
+    assertEquals(6, board2.rule_regions.size());
+    assertEquals(classes_before2 + 3, board2.rules.clearance_matrix.get_class_count(),
+        "6 regions over 3 distinct clearance values must append exactly 3 clearance classes");
+    // Same value -> same class; different value -> different class.
+    assertEquals(board2.rule_regions.get(0).clearance_class_no,
+        board2.rule_regions.get(1).clearance_class_no);
+    assertEquals(board2.rule_regions.get(0).clearance_class_no,
+        board2.rule_regions.get(3).clearance_class_no);
+    assertEquals(board2.rule_regions.get(2).clearance_class_no,
+        board2.rule_regions.get(4).clearance_class_no);
+    assertNotEquals(board2.rule_regions.get(0).clearance_class_no,
+        board2.rule_regions.get(2).clearance_class_no);
+    assertNotEquals(board2.rule_regions.get(0).clearance_class_no,
+        board2.rule_regions.get(5).clearance_class_no);
+    assertNotEquals(board2.rule_regions.get(2).clearance_class_no,
+        board2.rule_regions.get(5).clearance_class_no);
+    // And each shared class still requires exactly its own region clearance.
+    for (int i = 0; i < clearances.length; i++) {
+      RuleRegion region = board2.rule_regions.get(i);
+      assertEquals((int) Math.round(clearances[i] * 10), region.clearance);
+      assertEquals(region.clearance, board2.rules.clearance_matrix.get_value(
+          region.clearance_class_no, 1, 0, false),
+          "the shared class's matrix row must carry its own clearance value");
+    }
   }
 
   /**

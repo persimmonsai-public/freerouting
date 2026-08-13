@@ -210,6 +210,7 @@ public class SearchTreeManager {
     }
     this.compensated_search_trees.add(curr_autoroute_tree);
 
+    int inserted_items = 0;
     Iterator<UndoableObjects.UndoableObjectNode> it = this.board.item_list.start_read_object();
     for (;;) {
       Item curr_item = (Item) this.board.item_list.read_object(it);
@@ -217,8 +218,27 @@ public class SearchTreeManager {
         break;
       }
       curr_autoroute_tree.insert(curr_item);
+      ++inserted_items;
     }
+    // Diagnostic (once per clearance class, so effectively free): every distinct clearance
+    // class requested by the router materializes a SEPARATE full-board compensated search
+    // tree, kept in compensated_search_trees for the life of the board, plus one
+    // precalculated TileShape[] per item per tree (see ItemSearchTreesInfo). That makes the
+    // number of DISTINCT clearance classes -- not the size of the clearance matrix -- the
+    // memory scaling factor of the board. Anything that appends clearance classes
+    // per-configuration-entry (rule regions did, one class per region) multiplies the board.
+    FRLogger.info("[search-tree] allocated compensated tree for clearance class "
+        + p_clearance_class_no + ": trees_now=" + this.compensated_search_trees.size()
+        + " items_inserted=" + inserted_items
+        + " leaves=" + curr_autoroute_tree.size()
+        + " heap_used_mb=" + used_heap_mb());
     return curr_autoroute_tree;
+  }
+
+  /** Used heap in MiB, for the once-per-clearance-class tree allocation diagnostic. */
+  private static long used_heap_mb() {
+    Runtime rt = Runtime.getRuntime();
+    return (rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L);
   }
 
   /**

@@ -1620,3 +1620,145 @@ counter are identical. `CommitLookaheadTest` pins the decision rule against the 
 pairs (it fails if the rule stops keeping bm11's paying commit, stops declining bm01's toxic
 ones, or loses bm04's complementary chain, and it encodes the zero-margin refutation as an
 assertion); full non-slow unit suite green.
+
+## Region rules do not scale: the rollback, not the clearance matrix (2026-08-13)
+
+Region-scoped rules v1 (2a48855) fell over on the first real board it was pointed at. On
+`fixtures/mcgyver-1gnd-frozen.dsn` -- an 8-layer fine-pitch SOC/HBM export, 4887 net
+declarations, 3281 fixed wires, 758 vias, ~12k board items, 205 connections left to route
+-- **14 rule regions at `clearance_um` 76.2 (`layers: "*"`) OOM the router in pass 1**,
+while 4 regions on a much larger heap completed. The suspected mechanism was the clearance
+matrix: each region appends its own clearance class, and a clearance matrix is O(classes^2);
+the alternative suspect was the per-clearance-class search trees. **The matrix suspicion is
+simply wrong, the tree suspicion is real but an order of magnitude too small, and the thing
+that actually OOMs is neither.**
+
+**The clearance matrix is not the problem.** This board declares exactly **two** net classes
+(`kicad_default`, `power`). Fourteen appended classes take the matrix from 5x5 to 19x19 --
+a few hundred `int[8]` entries, kilobytes. Nothing there can OOM anything.
+
+**What a clearance class actually costs.** `SearchTreeManager.get_autoroute_tree` builds one
+FULL-BOARD compensated `ShapeSearchTree` per distinct clearance class the router routes at,
+registers it in `compensated_search_trees` for the life of the board, and gives every item a
+per-tree `SearchTreeInfo` holding a precalculated `TileShape[]`. Measured on this board via a
+new once-per-class `[search-tree]` diagnostic: **11,824-12,041 items -> 16,744-17,555 leaves,
+~11-15 MB per tree.** So the memory scales on the number of DISTINCT clearance classes, not on
+the matrix. Fourteen resident trees would be ~200 MB -- real, worth fixing, but still not a
+6 GB OOM.
+
+**The actual dominant consumer, measured.** Running the repro under `-Dfr.heap=2g` (new: the
+harness now sets the forked JVM's `maxHeapSize` and `-XX:+HeapDumpOnOutOfMemoryError`, so
+"how much heap does this need" is answerable at all) reproduces the OOM in ~3.5 minutes of
+routing. The OOM is thrown **inside `java.io.ObjectInputStream`** -- that is
+`BasicBoard.deserialize`, i.e. the region retry's rollback. Live class histogram at the wall
+(`jcmd GC.class_histogram`, which full-GCs first, so these are retained):
+
+| class | instances | bytes |
+|---|---|---|
+| `IntOctagon` | 7,739,778 | 371 MB |
+| `IntPoint` | 11,878,781 | 285 MB |
+| `MazeSearchElement` | 8,699,300 | 278 MB |
+| `ShapeTree$Leaf` | 3,810,437 | 122 MB |
+| `ShapeTree$InnerNode` | 3,810,220 | 122 MB |
+| `Line` | 4,615,233 | 111 MB |
+
+**The mechanism is the rollback, and the `[search-tree]` counter is what exposed it.**
+`BasicBoard.search_tree_manager` is `transient`. The v1 retry rolled a failed attempt back
+with `this.board = BasicBoard.deserialize(board_snapshot)` -- which replaces the board with a
+fresh copy **whose search trees are all gone**. So every rolled-back retry silently discarded
+the plain global tree too, and the next connection rebuilt it from all ~12k items. Counted in
+one pass of the repro: **145 full-board tree builds** -- 62x class 1 and 11x class 4 (the
+GLOBAL trees, pure rebuild waste) and 72 region-class builds spread over 6 different region
+classes. Each retry paid a full board serialize (live `byte[]` totalled ~9.5 MB), two
+full-board tree builds, and a full board deserialize, at roughly **1.3 seconds per retry**. The OOM peak is that
+deserialize running while the old board, its two freshly built trees, and the just-finished
+maze search's expansion rooms are all still reachable.
+
+**The control that decides it.** Flag-OFF on the same fixture, same `-Xmx2g`, 10-minute
+budget: **no OOM**. The board fits 2 GB comfortably; the regions are what breaks it. The
+earlier "4 regions/16 GB completes, 14 regions/6 GB OOMs" observation confounded region count
+with heap size -- at a fixed heap the variable that matters is how many failing connections
+have a terminal inside some region, because that is the retry count, and the cost is
+O(retries x board).
+
+**Two fixes, and only one of them was the one that mattered.**
+
+1. **Share one clearance class per distinct clearance VALUE** (`RuleRegion.install`). The
+   class is fully determined by its clearance -- its matrix row is that value against every
+   other class -- so regions carrying the same clearance are indistinguishable to the engine.
+   14 regions at one clearance now append **1** class instead of 14; a mixed set of 6 regions
+   over 3 values appends 3. This is the correct semantics and it removes the steady-state
+   tree multiplication, but **on this board it is not what fixes the OOM**: the rollback
+   discarded the trees between retries anyway, so per-retry cost was independent of class
+   count. Recorded as a partial: correct, necessary for boards where retries succeed and the
+   trees stay resident, insufficient alone here.
+2. **Roll back through the board's own undo stack** (`generate_snapshot` / `undo` /
+   `pop_snapshot`) instead of serialize/deserialize. This is the mechanism the partition
+   commit path, the trial-commit lookahead and `BatchOptimizer` already use. The board object
+   and its search trees survive; only the handful of items the retry touched are removed and
+   re-inserted incrementally.
+
+**After, same repro, same `-Dfr.heap=2g`, 14 regions:** **no OOM**. Full-board tree builds for
+the entire run fall from **145 to 3** (class 1, class 4, and the single shared region class 6).
+Heap oscillates between ~470 MB and ~1.3 GB with no monotonic climb, against a pre-fix curve
+that went 193 MB -> 1588 MB -> 2093 MB (wall) in three one-minute samples. **Peak heap actually
+needed is under 2 GB** -- the 6 GB the pre-fix configuration could not live in was never about
+the board.
+
+**What the repro board produces**, 14 regions, `-Dfr.heap=4g`, 40-minute budget: pass 1
+completes in 1804 s at **161.47 (111 unrouted and 1470 violations)**, the run reaches pass 2
+before the budget expires, and the harness's final recount is **108 incomplete**. Region-retry
+accounting over the run: **40 retries kept, 14 rolled back by the scope check**, spread over
+regions 1, 3, 4, 5 and 9. This answers the substantive question the 4-region run left open --
+with the trigger geometry correct and the memory bug gone, **the retry does fire and does
+succeed on a real board**, 40 times. The violation count is the open item: it is far above
+anything the small fixtures show and is not yet attributed (see below).
+
+**Missing instrumentation, added.** v1 logged only retry SUCCESS and ROLLBACK, so "the trigger
+never fired" and "the retry ran and failed again" were the same silence -- and on this board it
+was the second one, which nothing in the log said. There is now one flag-gated line
+`[rule-region] <scope> retry_candidates=.. no_region=.. attempted=.. route_failed=..
+scope_rollback=.. kept=.. regions=..`, separating failed connections that reached the retry,
+those with no region to trigger on, those actually attempted, and each terminal outcome. It is
+emitted at the end of every pass AND at the end of the stage: on a fixture this size the
+routing budget expires mid-pass and the pass loop is never left, so an end-of-stage-only line
+is exactly the line you do not get on the boards where you need it. Flag-off emits nothing.
+
+**A units trap, and a guard for it.** `box_um` is the raw coordinate number **as written in the
+DSN file**, not that number divided by the file's resolution -- the parser scales raw file
+coordinates by the resolution, so dividing first puts every box off-board by 10x. Fourteen
+regions built that way install cleanly, log cleanly, cost their clearance classes and never
+fire once. `RuleRegion.install` now warns when a region box does not intersect the board
+bounding box.
+
+**Verification.** Flag-off gates EXACT on the fixed code: bm01 **989.72/2/0** (unrouted
+{ADC12, TXD1}); bm01 negotiation champion **994.85/1/0** on board
+`99a806640164088bc042d9a8aee396b1` with the champion counters (committed=3,
+attempt_drc_rejects=13); bm05 2-min **831.77/18/0**; bm04 10-min **979.01/3/0** (unrouted
+{/PB7, /PB6, /MOSI}). Region behavior is unchanged: `RuleRegionRoutingTest` still passes
+(in-region DRC passes and outside-region fails; flag-off 1 unrouted vs flag-on 0 unrouted /
+0 violations; 2/2 identical flag-on board hashes), plus a new test pinning the class-sharing
+invariant -- 14 regions at one clearance append exactly 1 class, 6 regions over 3 clearance
+values append exactly 3, and each shared class still carries its own clearance value.
+Determinism on a region-enabled run (bm01, 4 regions at `clearance_um` 100, which share one
+class): **2/2 identical** -- 923.06/15/0 both runs, identical unrouted set, and every funnel
+counter identical (`retry_candidates=74 no_region=0 attempted=74 route_failed=17
+scope_rollback=21 kept=36 regions=4`). Full non-slow unit suite green.
+
+**OPEN ITEM, not closed by this increment: the 1470 violations.** The region-enabled pass 1 on
+the repro board ends at 1470 clearance violations. That number is not explained by the region
+DRC rule -- the region clearance (762) is TIGHTER than this board's global clearance (900), so
+`min(global, region)` relaxes nothing here, and traces the retry inserts carry the region class
+whose matrix row requires 762 against everything, so the scored DRC agrees they are legal. The
+honest statement is that it is unattributed: the flag-off baseline for pass 1 on this fixture
+has not been measured to completion, so it is not yet known how much of the 1470 the regions
+own. **Do not read the region retry as violation-free on a real board until that A/B exists.**
+The memory fix is what this increment claims; the routing quality of region rules on a real
+dense board is the next thing to measure.
+
+**Harness.** `-Dfr.heap=<size>` sets the forked test JVM's max heap and enables
+`-XX:+HeapDumpOnOutOfMemoryError`; `-Dfr.tasktimeout=<minutes>` raises the gradle test-task
+wall clock for long fixtures. Both default to the previous behavior. Without the first,
+"how much heap does this configuration need" is not a question the harness could answer --
+the fork inherited 1/4 of physical RAM and the number differed per machine.
+

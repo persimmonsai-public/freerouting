@@ -2634,6 +2634,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       if (!isOptimizerAutorouter) {
         job.logInfo(passCompletedMessage);
       }
+      log_rule_region_summary("pass #" + currentPass);
 
       DesignRulesChecker tempDrc = new DesignRulesChecker(this.board, null);
       tempDrc.calculateAllIncompletes();
@@ -2757,6 +2758,8 @@ public class BatchAutorouter extends NamedAlgorithm {
         currentPass++;
       }
     }
+
+    log_rule_region_summary("stage");
 
     // Ensure we finish with the best board ever seen during this routing session.
     // When stagnation or the max-pass limit fires, the loop exits with the board from the last
@@ -3027,10 +3030,11 @@ public class BatchAutorouter extends NamedAlgorithm {
             }
             return region_result;
           }
-          // The retry mutated the board and was rolled back via a snapshot restore, so item
-          // identities from before the retry are stale. Report the original failure without
-          // chaining further retries against stale item sets (same containment contract as
-          // the strict-DRC restore).
+          // The retry mutated the board and was rolled back through the undo stack. Report the
+          // original failure without chaining further retries: the connection has already been
+          // attempted at both the global and the region rules on this board state, and the
+          // later retries in this method (neck width, etc.) are not meaningful after a rip-up
+          // rollback.
           return autoroute_result;
         }
       }
@@ -3136,6 +3140,52 @@ public class BatchAutorouter extends NamedAlgorithm {
     return neck_result;
   }
 
+  /**
+   * Region-retry accounting. v1 logged only the two terminal outcomes (kept / rolled back),
+   * which made "the trigger never fired" indistinguishable from "the retry ran and failed
+   * again" -- on a real board both look like silence. These separate the stages: how many
+   * failed connections reached the retry at all, how many had no region to trigger on, how
+   * many actually ran, and how each run ended. All are plain longs bumped on the sequential
+   * router path only and reported once per routing stage under the flag, so flag-off output
+   * and cost are unchanged.
+   */
+  private long region_retry_candidates;
+  /** Candidates where findTriggeringRegion returned null: no retry was attempted. */
+  private long region_retry_no_region;
+  /** Candidates where the retry actually ran (a region triggered). */
+  private long region_retry_attempted;
+  /** Attempts where the maze search still did not route the connection. */
+  private long region_retry_route_failed;
+  /** Attempts that routed but were rolled back by the outside-region global-rule scope check. */
+  private long region_retry_scope_rollback;
+  /** Attempts that routed and were kept (the strict-DRC gate may still reject them later). */
+  private long region_retry_kept;
+
+  /**
+   * One summary line with the full region-retry funnel (counters are cumulative over the
+   * stage), or nothing at all when region rules are off, so flag-off log output stays
+   * byte-identical.
+   *
+   * <p>Emitted at the end of every pass as well as at the end of the stage. On a big fixture
+   * the routing budget usually expires mid-pass and the pass loop is never left, so an
+   * end-of-stage-only line is exactly the line you do not get on the boards where you need it.
+   *
+   * @param p_scope "pass #N" or "stage", so the two emission sites are distinguishable.
+   */
+  private void log_rule_region_summary(String p_scope) {
+    if (!isRuleRegionsEnabled()) {
+      return;
+    }
+    job.logInfo("[rule-region] " + p_scope
+        + " retry_candidates=" + region_retry_candidates
+        + " no_region=" + region_retry_no_region
+        + " attempted=" + region_retry_attempted
+        + " route_failed=" + region_retry_route_failed
+        + " scope_rollback=" + region_retry_scope_rollback
+        + " kept=" + region_retry_kept
+        + " regions=" + (this.board.rule_regions != null ? this.board.rule_regions.size() : 0));
+  }
+
   /** Region-scoped rules are active only when the flag is on AND regions were installed. */
   private boolean isRuleRegionsEnabled() {
     return this.board.rule_regions != null
@@ -3162,21 +3212,41 @@ public class BatchAutorouter extends NamedAlgorithm {
    * it when enabled).
    *
    * @return a ROUTED result when the retry succeeded and was kept; a non-ROUTED result when
-   *         the retry ran but was rolled back (the board was restored from a snapshot, so
-   *         the caller must not touch pre-retry item references); or null when no region
+   *         the retry ran and was rolled back through the board's undo stack (the board
+   *         object and its search trees survive the rollback, but the caller still reports
+   *         the original failure rather than chaining another retry); or null when no region
    *         triggered and the board was not touched.
    */
   private AutorouteAttemptResult retryConnectionInRegion(int p_route_net_no, int p_via_costs,
       Set<Item> p_route_start_set, Set<Item> p_route_dest_set, SortedSet<Item> p_ripped_item_list,
       Map<Item, Integer> p_ripup_costs, int p_ripup_pass_no, TimeLimit p_time_limit) {
+    ++region_retry_candidates;
     app.freerouting.board.RuleRegion region = findTriggeringRegion(p_route_start_set, p_route_dest_set);
     if (region == null) {
+      ++region_retry_no_region;
       return null;
     }
+    ++region_retry_attempted;
     Net route_net = board.rules.nets.get(p_route_net_no);
     String net_name = (route_net != null) ? route_net.name : ("#" + p_route_net_no);
     int max_item_id_before = board.communication.id_no_generator.max_generated_no();
-    byte[] board_snapshot = board.serialize(false);
+    // Roll back through the board's own undo stack, NOT through serialize/deserialize.
+    // Measured on the 8-layer repro (docs/dense-bga-roadmap.md): a byte[]-snapshot rollback
+    // replaces this.board with a freshly deserialized copy, whose search_tree_manager is
+    // transient -- so every rolled-back retry silently threw away EVERY compensated search
+    // tree and the next connection rebuilt them from all ~12k board items. 83 region retries
+    // in one pass caused 145 full-board tree builds (73 of them rebuilds of the plain global
+    // tree) and OOM-ed a 2 GB heap inside ObjectInputStream. undo() keeps the same board and
+    // the same trees, updating them incrementally for the handful of items the retry touched
+    // -- the same rollback mechanism the partition commit path and the lookahead already use.
+    //
+    // Two preconditions make the now-SURVIVING region tree safe. (1) The engine is created
+    // with retain_autoroute_database = false, so AutorouteEngine.clear() runs at the end of
+    // every autoroute_connection and removes that connection's expansion rooms from the tree
+    // it searched -- nothing stale is left behind in a tree that outlives the attempt.
+    // (2) undo() routes its removals and insertions through search_tree_manager, which
+    // updates EVERY compensated tree, so the region tree stays in sync with the board.
+    board.generate_snapshot();
 
     AutorouteControl region_control = new AutorouteControl(this.board, p_route_net_no, settings,
         p_via_costs, this.trace_cost_arr);
@@ -3201,7 +3271,8 @@ public class BatchAutorouter extends NamedAlgorithm {
     if (region_result.state != AutorouteAttemptState.ROUTED) {
       // The failed attempt may have ripped or shoved items: restore the exact pre-retry
       // board so the retry is invisible unless it succeeds.
-      this.board = (RoutingBoard) BasicBoard.deserialize(board_snapshot);
+      ++region_retry_route_failed;
+      board.undo(null);
       return region_result;
     }
     board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, region_control.trace_costs,
@@ -3209,11 +3280,15 @@ public class BatchAutorouter extends NamedAlgorithm {
     String reject_reason = checkRegionScopedInsertion(p_route_net_no, max_item_id_before, region,
         global_clearance_class);
     if (reject_reason != null) {
+      ++region_retry_scope_rollback;
       FRLogger.info("[rule-region] retry for net '" + net_name + "' rolled back: " + reject_reason);
-      this.board = (RoutingBoard) BasicBoard.deserialize(board_snapshot);
+      board.undo(null);
       return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
           "rule_region: " + reject_reason);
     }
+    // Kept: drop the undo snapshot so the stack does not grow per kept retry.
+    board.pop_snapshot();
+    ++region_retry_kept;
     FRLogger.info("[rule-region] routed net '" + net_name + "' at region rules ("
         + region.name + ", clearance=" + region.clearance
         + ", trace_half_width=" + region.trace_half_width + ").");

@@ -479,12 +479,29 @@ tasks.withType(Test).configureEach { Test task ->
         systemProperty k, v
     }
 
+    // -Dfr.heap=<size> sets the forked test JVM's maximum heap (e.g. -Dfr.heap=4g) and turns on
+    // heap-dump-on-OOM. Memory-scaling measurements need the heap under the harness's control:
+    // without this the fork inherits the JVM default (1/4 of physical RAM), which differs per
+    // machine and makes "how much heap does this configuration need" unmeasurable. Read through
+    // the provider API for the same configuration-cache reason as the fr.* forwarding above.
+    def testHeap = providers.systemProperty('fr.heap')
+    if (testHeap.isPresent() && !testHeap.get().isBlank()) {
+        maxHeapSize = testHeap.get()
+        jvmArgs "-XX:+HeapDumpOnOutOfMemoryError"
+    }
+
     testLogging {
         showExceptions = true
         showStandardStreams = true
     }
 
-    timeout = Duration.ofMinutes(30)
+    // Wall-clock cap for the whole test task. Overridable with -Dfr.tasktimeout=<minutes> for
+    // long measurement runs on big fixtures (the routing budget itself is -Dfr.timeout); the
+    // default is unchanged, so ordinary runs and the gate runs are unaffected.
+    def taskTimeoutMinutes = providers.systemProperty('fr.tasktimeout')
+    timeout = Duration.ofMinutes(taskTimeoutMinutes.isPresent()
+        ? taskTimeoutMinutes.get().toInteger()
+        : 30)
 
     // Attach Mockito as a Java agent so that the inline-mock-maker can function
     // on Java 21+ without the JVM's self-attach restriction warning.
